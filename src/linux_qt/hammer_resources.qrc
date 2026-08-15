@@ -1,0 +1,28 @@
+<RCC>
+    <qresource prefix="/hammer">
+        <file alias="forgemap.bmp">../hammer/res/forgemap.bmp</file>
+        <file alias="mapedit256.bmp">../hammer/res/mapedit256.bmp</file>
+        <file alias="toolbar1.bmp">../hammer/res/toolbar1.bmp</file>
+        <file alias="undoredo.bmp">../hammer/res/undoredo.bmp</file>
+        <file alias="seltools.bmp">../hammer/res/seltools.bmp</file>
+        <file alias="newsplash.bmp">../hammer/res/newsplash.bmp</file>
+        <file alias="forge.ico">../hammer/res/forge.ico</file>
+        <file alias="forgedoc.ico">../hammer/res/forgedoc.ico</file>
+        <file alias="camera.ico">../hammer/res/camera.ico</file>
+        <file alias="crosshair.ico">../hammer/res/crosshair.ico</file>
+        <file alias="eyedropper.ico">../hammer/res/eyedropper.ico</file>
+        <file alias="app_logo.png">resources/app_logo.png</file>
+        <file alias="window_icon.png">resources/window_icon.png</file>
+        <file alias="tool_icons/brush_tool.png">resources/tool_icons/brush_tool.png</file>
+        <file alias="tool_icons/camera_tool.png">resources/tool_icons/camera_tool.png</file>
+        <file alias="tool_icons/clip_tool.png">resources/tool_icons/clip_tool.png</file>
+        <file alias="tool_icons/decal_tool.png">resources/tool_icons/decal_tool.png</file>
+        <file alias="tool_icons/entity_tool.png">resources/tool_icons/entity_tool.png</file>
+        <file alias="tool_icons/face_tool.png">resources/tool_icons/face_tool.png</file>
+        <file alias="tool_icons/magnify_tool.png">resources/tool_icons/magnify_tool.png</file>
+        <file alias="tool_icons/overlay_tool.png">resources/tool_icons/overlay_tool.png</file>
+        <file alias="tool_icons/select_tool.png">resources/tool_icons/select_tool.png</file>
+        <file alias="tool_icons/texture_tool.png">resources/tool_icons/texture_tool.png</file>
+        <file alias="tool_icons/vertex_tool.png">resources/tool_icons/vertex_tool.png</file>
+    </qresource>
+</RCC>

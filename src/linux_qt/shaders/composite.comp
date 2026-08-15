@@ -1,0 +1,126 @@
+#version 460
+
+// Source HDR display conversion: exposure, bloom, gamma, colour correction.
+//
+// Source 1 adds the blurred bloom buffer to the exposed HDR framebuffer, then
+// converts to gamma space, then runs the colour-correction lookup on the
+// resulting framebuffer values. Preserving that order matters: correcting
+// before the gamma conversion would feed the LUT linear values it was never
+// authored against.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D outputImage;
+layout(std140, set = 0, binding = 7) uniform CameraBuffer {
+    vec4 cameraPosition;
+    vec4 cameraForwardTanHalfFov;
+    vec4 cameraRightAspect;
+    vec4 cameraUpNear;
+    vec4 sunDirectionIntensity;
+    vec4 sunColorTime;
+    vec4 effectIntensities;
+    vec4 backgroundColor;
+    uvec4 renderControls;
+    vec4 skyRects[6];
+    // x = tone scale, y = bloom scale, z = uncorrected colour-correction weight,
+    // w = display gamma (mat_monitorgamma). Zero means the 2.2 default.
+    vec4 toneMapControls;
+    vec4 colorCorrectionWeights;
+    uvec4 colorCorrectionIndices;
+    uvec4 radiosityControls;
+} cameraData;
+layout(std430, set = 0, binding = 9) readonly buffer ColorCorrectionBuffer {
+    uint colorCorrectionLutTexels[];
+};
+layout(set = 0, binding = 14, rgba16f) uniform readonly image2D hdrImage;
+layout(set = 0, binding = 15, rgba16f) uniform readonly image2D bloomImage;
+
+// Source's mat_monitorgamma: the display transfer curve, not the 2.2 the
+// artwork itself is authored in. Raising it lifts the shadows the way turning
+// up a monitor's gamma does, so dark rooms stay readable while editing.
+vec3 sourceLinearToGamma(vec3 color) {
+    float gamma = cameraData.toneMapControls.w > 0.0 ? cameraData.toneMapControls.w : 2.2;
+    return pow(max(color, vec3(0.0)), vec3(1.0 / gamma));
+}
+
+vec3 finiteColor(vec3 color) {
+    bvec3 bad = bvec3(isnan(color.r) || isinf(color.r),
+                      isnan(color.g) || isinf(color.g),
+                      isnan(color.b) || isinf(color.b));
+    return vec3(bad.r ? 0.0 : color.r, bad.g ? 0.0 : color.g, bad.b ? 0.0 : color.b);
+}
+
+vec3 sourceColorCorrectionTexel(uint lookup, ivec3 coordinate) {
+    coordinate = clamp(coordinate, ivec3(0), ivec3(31));
+    uint offset = lookup * 32768u + uint(coordinate.z * 1024 + coordinate.y * 32 + coordinate.x);
+    uint packed = colorCorrectionLutTexels[offset];
+    return vec3(float(packed & 255u), float((packed >> 8u) & 255u),
+                float((packed >> 16u) & 255u)) / 255.0;
+}
+
+vec3 sampleSourceColorCorrection(uint lookup, vec3 gammaColor) {
+    vec3 position = clamp(gammaColor, 0.0, 1.0) * 31.0;
+    ivec3 lo = ivec3(floor(position));
+    ivec3 hi = min(lo + ivec3(1), ivec3(31));
+    vec3 f = fract(position);
+    vec3 c000 = sourceColorCorrectionTexel(lookup, ivec3(lo.x, lo.y, lo.z));
+    vec3 c100 = sourceColorCorrectionTexel(lookup, ivec3(hi.x, lo.y, lo.z));
+    vec3 c010 = sourceColorCorrectionTexel(lookup, ivec3(lo.x, hi.y, lo.z));
+    vec3 c110 = sourceColorCorrectionTexel(lookup, ivec3(hi.x, hi.y, lo.z));
+    vec3 c001 = sourceColorCorrectionTexel(lookup, ivec3(lo.x, lo.y, hi.z));
+    vec3 c101 = sourceColorCorrectionTexel(lookup, ivec3(hi.x, lo.y, hi.z));
+    vec3 c011 = sourceColorCorrectionTexel(lookup, ivec3(lo.x, hi.y, hi.z));
+    vec3 c111 = sourceColorCorrectionTexel(lookup, ivec3(hi.x, hi.y, hi.z));
+    vec3 c00 = mix(c000, c100, f.x);
+    vec3 c10 = mix(c010, c110, f.x);
+    vec3 c01 = mix(c001, c101, f.x);
+    vec3 c11 = mix(c011, c111, f.x);
+    return mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z);
+}
+
+vec3 applySourceColorCorrection(vec3 gammaColor) {
+    vec3 corrected = gammaColor * cameraData.toneMapControls.z;
+    for (int i = 0; i < 4; ++i) {
+        float weight = cameraData.colorCorrectionWeights[i];
+        if (weight <= 0.0001) continue;
+        corrected += sampleSourceColorCorrection(cameraData.colorCorrectionIndices[i],
+                                                 gammaColor) * weight;
+    }
+    return clamp(corrected, 0.0, 1.0);
+}
+
+// Bilinear tap of the quarter-resolution bloom buffer.
+vec3 sampleBloom(ivec2 pixel, ivec2 fullSize) {
+    ivec2 size = imageSize(bloomImage);
+    vec2 coordinate = (vec2(pixel) + 0.5) / vec2(fullSize) * vec2(size) - 0.5;
+    vec2 base = floor(coordinate);
+    vec2 f = clamp(coordinate - base, 0.0, 1.0);
+    vec3 accumulated = vec3(0.0);
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            ivec2 tap = clamp(ivec2(base) + ivec2(x, y), ivec2(0), size - 1);
+            float weight = (x == 0 ? 1.0 - f.x : f.x) * (y == 0 ? 1.0 - f.y : f.y);
+            accumulated += imageLoad(bloomImage, tap).rgb * weight;
+        }
+    }
+    return accumulated;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputImage);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    vec3 color = finiteColor(imageLoad(hdrImage, pixel).rgb) *
+                 max(cameraData.toneMapControls.x, 0.0);
+
+    // mat_bloomscale. Cubemap bakes pass 0 here so post-processing is never
+    // burned into a baked face.
+    float bloomScale = max(cameraData.toneMapControls.y, 0.0);
+    if (bloomScale > 0.0)
+        color += finiteColor(sampleBloom(pixel, size)) * bloomScale;
+
+    color = sourceLinearToGamma(color);
+    color = applySourceColorCorrection(clamp(color, 0.0, 1.0));
+    imageStore(outputImage, pixel, vec4(clamp(finiteColor(color), 0.0, 1.0), 1.0));
+}

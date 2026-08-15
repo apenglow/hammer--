@@ -1,0 +1,37 @@
+# Cross-build environment for the Windows build of Hammer--.
+#
+# Fedora's MinGW packages provide a full Qt 6 for x86_64 Windows plus the
+# mingw64-cmake wrapper that configures CMake for cross-compilation. The
+# vendored protobuf is cross-compiled by the project itself; code generation
+# at build time needs a NATIVE protoc of the exact same version, which this
+# image builds once into /opt/protoc.
+#
+# Build once:  podman build -t hammer-windows-build -f scripts/Containerfile.windows scripts
+# Then package with: scripts/package-windows.sh
+FROM fedora:43
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        mingw64-gcc-c++ mingw64-qt6-qtbase mingw64-winpthreads mingw64-openssl \
+        cmake ninja-build make git gcc-c++ zip file \
+    && dnf clean all
+
+# GameNetworkingSockets links Windows import libraries by their Windows-style
+# capitalized names (Iphlpapi); Fedora ships them lowercase and Linux
+# filesystems are case-sensitive.
+RUN cd /usr/x86_64-w64-mingw32/sys-root/mingw/lib \
+    && for lib in iphlpapi winmm crypt32 ws2_32; do \
+           cap="$(echo "${lib:0:1}" | tr a-z A-Z)${lib:1}"; \
+           [ -f "lib$lib.a" ] && [ ! -e "lib$cap.a" ] && ln -s "lib$lib.a" "lib$cap.a"; \
+       done; true
+
+# Native protoc matching the vendored protobuf (v21.12) exactly: generated
+# .pb.cc files must agree with the cross-compiled libprotobuf's headers.
+RUN git clone --depth 1 --branch v21.12 https://github.com/protocolbuffers/protobuf.git /tmp/protobuf \
+    && cmake -S /tmp/protobuf -B /tmp/protobuf-build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -Dprotobuf_BUILD_TESTS=OFF \
+        -Dprotobuf_BUILD_SHARED_LIBS=OFF -Dprotobuf_WITH_ZLIB=OFF \
+        -DCMAKE_INSTALL_PREFIX=/opt/protoc \
+    && cmake --build /tmp/protobuf-build --target protoc -j"$(nproc)" \
+    && mkdir -p /opt/protoc/bin \
+    && cp /tmp/protobuf-build/protoc /opt/protoc/bin/protoc \
+    && rm -rf /tmp/protobuf /tmp/protobuf-build

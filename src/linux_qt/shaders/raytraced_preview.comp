@@ -1,0 +1,1390 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const uint RT_HAS_SECONDARY             = 1u << 0;
+const uint RT_BLENDED                   = 1u << 1;
+const uint RT_HAS_BUMP                  = 1u << 2;
+const uint RT_PHONG                     = 1u << 3;
+const uint RT_SPECULAR                  = 1u << 4;
+const uint RT_SELFILLUM                 = 1u << 5;
+const uint RT_SELFILLUM_FRESNEL         = 1u << 6;
+const uint RT_HAS_SELFILLUM_MASK        = 1u << 7;
+const uint RT_HAS_LIGHTWARP             = 1u << 8;
+const uint RT_HALF_LAMBERT              = 1u << 9;
+const uint RT_RIMLIGHT                  = 1u << 10;
+const uint RT_WATER                     = 1u << 11;
+const uint RT_TRANSLUCENT               = 1u << 12;
+const uint RT_COLOR2                    = 1u << 13;
+const uint RT_BLEND_TINT_BASE_ALPHA     = 1u << 14;
+const uint RT_PHONG_MASK_BASE_ALPHA     = 1u << 15;
+const uint RT_ENV_MASK_BASE_ALPHA       = 1u << 16;
+const uint RT_ENV_MASK_NORMAL_ALPHA     = 1u << 17;
+const uint RT_INVERT_SPECULAR_MASK      = 1u << 18;
+const uint RT_HAS_EXPONENT              = 1u << 19;
+const uint RT_PHONG_EXPONENT_OVERRIDE   = 1u << 20;
+const uint RT_PHONG_ALBEDO_TINT         = 1u << 21;
+const uint RT_RIM_MASK_EXPONENT_ALPHA   = 1u << 22;
+const uint RT_HIGH_ENERGY               = 1u << 23;
+const uint RT_UBER                      = 1u << 24;
+const uint RT_HAS_FLOW                  = 1u << 25;
+const uint RT_WATER_NO_FRESNEL          = 1u << 26;
+const uint RT_WATER_MULTI_TEXTURE       = 1u << 27;
+const uint RT_HAS_ENVMAP                = 1u << 28;
+const uint RT_DECAL_MODULATE            = 1u << 29;
+const uint RT_COMPILE_TRIGGER           = 1u << 30;
+const uint RT2_HAS_DETAIL               = 1u << 0;
+const uint RT2_ALPHA_TEST               = 1u << 1;
+const uint TRIANGLE_TWO_SIDED           = 1u << 0;
+const uint TRIANGLE_NO_SHADOW           = 1u << 2;
+const uint TRIANGLE_NO_PRIMARY          = 1u << 3;
+const uint TRIANGLE_SKY                 = 1u << 4;
+const uint TRIANGLE_SPRITE              = 1u << 5;
+const uint TRIANGLE_UNLIT               = 1u << 6;
+const uint TRIANGLE_STATIC_PROP         = 1u << 7;
+const uint TRIANGLE_HAS_LIGHTMAP        = 1u << 8;
+const uint TRIANGLE_DISPLACEMENT         = 1u << 9;
+
+const uint CONTROL_PHONG                = 1u << 0;
+const uint CONTROL_SPECULAR             = 1u << 1;
+const uint CONTROL_BUMP                 = 1u << 2;
+const uint CONTROL_LIGHTWARP            = 1u << 3;
+const uint CONTROL_SELFILLUM            = 1u << 4;
+const uint CONTROL_RIMLIGHT             = 1u << 5;
+const uint CONTROL_DENOISE              = 1u << 6;
+const uint CONTROL_INTERACTIVE          = 1u << 7;
+
+struct VertexRecord {
+    vec4 position;
+    vec4 normal;
+    vec4 tangent;
+    vec4 texCoord;
+    vec4 surface;
+};
+
+struct TriangleRecord {
+    uvec4 data;
+};
+
+struct MaterialRecord {
+    vec4 baseRect;
+    vec4 secondaryRect;
+    vec4 detailRect;
+    vec4 bumpRect;
+    vec4 exponentRect;
+    vec4 selfIllumRect;
+    vec4 lightWarpRect;
+    vec4 flowRect;
+    vec4 environmentRects[6];
+    vec4 color2;
+    vec4 phongTintExponent;
+    vec4 envTintBoost;
+    vec4 selfIllumTintSpecular;
+    vec4 phongFresnelRimExponent;
+    vec4 selfIllumFresnelRimBoost;
+    vec4 detailAlphaControls;
+    vec4 waterFogAlpha;
+    vec4 waterRefractAmount;
+    vec4 waterReflectAmount;
+    vec4 waterControls;
+    vec4 waterScaleScroll1;
+    vec4 waterScroll2NormalCycle;
+    vec4 waterFlow;
+    vec4 transparencyControls;
+    uvec4 flags;
+};
+
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D outputImage;
+layout(set = 0, binding = 1) uniform accelerationStructureEXT sceneAccelerationStructure;
+layout(std430, set = 0, binding = 2) readonly buffer VertexBuffer { VertexRecord vertices[]; };
+layout(std430, set = 0, binding = 3) readonly buffer IndexBuffer { uint indices[]; };
+layout(std430, set = 0, binding = 4) readonly buffer TriangleBuffer { TriangleRecord triangles[]; };
+layout(std430, set = 0, binding = 5) readonly buffer MaterialBuffer { MaterialRecord materials[]; };
+layout(set = 0, binding = 6) uniform sampler2DArray materialAtlas;
+
+layout(std140, set = 0, binding = 7) uniform CameraBuffer {
+    vec4 cameraPosition;
+    vec4 cameraForwardTanHalfFov;
+    vec4 cameraRightAspect;
+    vec4 cameraUpNear;
+    vec4 sunDirectionIntensity;
+    vec4 sunColorTime;
+    vec4 effectIntensities;
+    vec4 backgroundColor;
+    uvec4 renderControls;
+    vec4 skyRects[6];
+    vec4 toneMapControls;
+    vec4 colorCorrectionWeights;
+    uvec4 colorCorrectionIndices;
+    // xy = patch atlas size, z = 1 when the bounce solve has usable results.
+    uvec4 radiosityControls;
+} cameraData;
+
+struct LightRecord {
+    vec4 positionType;
+    vec4 directionRange;
+    vec4 colorIntensity;
+    vec4 attenuationOuter;
+    vec4 innerControls;
+    // x = m_flCapDist, y = m_flStartFadeDistance, z = m_flEndFadeDistance.
+    vec4 fadeControls;
+};
+layout(std430, set = 0, binding = 8) readonly buffer LightBuffer { LightRecord mapLights[]; };
+layout(std430, set = 0, binding = 9) readonly buffer ColorCorrectionBuffer { uint colorCorrectionLutTexels[]; };
+layout(std430, set = 0, binding = 10) buffer ExposureHistogramBuffer { uint exposureHistogram[]; };
+
+// VRAD radiosity patch grid. The bounce solve writes patchTotal once per scene
+// rebuild; shading reads it per pixel. Layouts match rad_common.glsl.
+struct RectRecord {
+    vec4 rect;      // x, y, width, height in patches
+    vec4 origin;    // originS, originT, patch scale
+    vec4 uAxis;     // xyz direction, w shift
+    vec4 vAxis;     // xyz direction, w shift
+    uvec4 identity;
+};
+layout(std430, set = 0, binding = 11) readonly buffer RadPatchRectBuffer {
+    RectRecord patchRects[];
+};
+layout(std430, set = 0, binding = 12) readonly buffer RadPatchIndexBuffer {
+    uint patchIndexGrid[];
+};
+layout(std430, set = 0, binding = 13) readonly buffer RadPatchTotalBuffer {
+    vec4 patchTotal[];
+};
+
+// Linear, pre-exposure scene light. Bloom needs the values the frame had
+// before tonemapping compressed them, so the preview stops at linear HDR and
+// composite.comp applies exposure, bloom, gamma and colour correction.
+layout(set = 0, binding = 14, rgba16f) uniform writeonly image2D hdrTarget;
+
+// Static-prop ambient cubes from the radiosity bake: six directional
+// coefficients per prop-triangle corner, three corners per triangle, addressed
+// by TriangleRecord.data.w. A prop has no lightmap to hang bounced light off,
+// so this is the only place it exists for one.
+layout(std430, set = 0, binding = 17) readonly buffer PropCubeBuffer {
+    vec4 propCube[];
+};
+
+struct HitRecord {
+    bool hit;
+    float distance;
+    uint primitive;
+    uint material;
+    vec3 position;
+    vec3 geometricNormal;
+    vec3 normal;
+    vec4 tangent;
+    vec2 uv;
+    vec2 uv2;
+    float blend;
+    bool frontFace;
+    // Barycentric weights of the hit, kept so per-vertex bake results can be
+    // interpolated across the triangle the same way its attributes are.
+    vec3 weights;
+};
+
+bool hasRect(vec4 rect) { return rect.z > 0.0 && rect.w > 0.0; }
+// Source/Hammer treats artwork as gamma 2.2 in its lighting preview and
+// LightForString paths. Keep RT material decode/encode on the same curve instead
+// of mixing IEC sRGB with Source's 2.2-authored assets.
+vec3 sourceGammaToLinear(vec3 color) {
+    return pow(clamp(color, vec3(0.0), vec3(1.0)), vec3(2.2));
+}
+vec3 sourceLinearToGamma(vec3 color) {
+    return pow(max(color, vec3(0.0)), vec3(1.0 / 2.2));
+}
+vec3 finiteColor(vec3 color) {
+    bvec3 bad = bvec3(isnan(color.r) || isinf(color.r),
+                      isnan(color.g) || isinf(color.g),
+                      isnan(color.b) || isinf(color.b));
+    return vec3(bad.r ? 0.0 : color.r,
+                bad.g ? 0.0 : color.g,
+                bad.b ? 0.0 : color.b);
+}
+vec3 sourceColorCorrectionTexel(uint lookup, ivec3 coordinate) {
+    coordinate = clamp(coordinate, ivec3(0), ivec3(31));
+    uint offset = lookup * 32768u + uint(coordinate.z * 1024 + coordinate.y * 32 + coordinate.x);
+    uint packed = colorCorrectionLutTexels[offset];
+    return vec3(float(packed & 255u),
+                float((packed >> 8u) & 255u),
+                float((packed >> 16u) & 255u)) / 255.0;
+}
+vec3 sampleSourceColorCorrection(uint lookup, vec3 gammaColor) {
+    // Equivalent to Source's 32^3 tex3D lookup at color*(31/32)+0.5/32.
+    vec3 position = clamp(gammaColor, 0.0, 1.0) * 31.0;
+    ivec3 lo = ivec3(floor(position));
+    ivec3 hi = min(lo + ivec3(1), ivec3(31));
+    vec3 f = fract(position);
+    vec3 c000 = sourceColorCorrectionTexel(lookup, ivec3(lo.x, lo.y, lo.z));
+    vec3 c100 = sourceColorCorrectionTexel(lookup, ivec3(hi.x, lo.y, lo.z));
+    vec3 c010 = sourceColorCorrectionTexel(lookup, ivec3(lo.x, hi.y, lo.z));
+    vec3 c110 = sourceColorCorrectionTexel(lookup, ivec3(hi.x, hi.y, lo.z));
+    vec3 c001 = sourceColorCorrectionTexel(lookup, ivec3(lo.x, lo.y, hi.z));
+    vec3 c101 = sourceColorCorrectionTexel(lookup, ivec3(hi.x, lo.y, hi.z));
+    vec3 c011 = sourceColorCorrectionTexel(lookup, ivec3(lo.x, hi.y, hi.z));
+    vec3 c111 = sourceColorCorrectionTexel(lookup, ivec3(hi.x, hi.y, hi.z));
+    vec3 c00 = mix(c000, c100, f.x);
+    vec3 c10 = mix(c010, c110, f.x);
+    vec3 c01 = mix(c001, c101, f.x);
+    vec3 c11 = mix(c011, c111, f.x);
+    return mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z);
+}
+vec3 applySourceColorCorrection(vec3 gammaColor) {
+    vec3 corrected = gammaColor * cameraData.toneMapControls.z;
+    for (int i = 0; i < 4; ++i) {
+        float weight = cameraData.colorCorrectionWeights[i];
+        if (weight <= 0.0001) continue;
+        corrected += sampleSourceColorCorrection(cameraData.colorCorrectionIndices[i], gammaColor) * weight;
+    }
+    return clamp(corrected, 0.0, 1.0);
+}
+vec3 atlasCoordinate(vec4 rect, vec2 uv) {
+    ivec3 atlasSize = textureSize(materialAtlas, 0);
+    vec2 inset = vec2(0.5) / vec2(atlasSize.xy);
+    float layer = floor(rect.x + 0.0001);
+    vec2 pageOrigin = vec2(fract(rect.x), rect.y);
+    vec2 pageUv = pageOrigin + inset +
+        fract(uv) * max(rect.zw - inset * 2.0, vec2(0.0));
+    return vec3(pageUv, layer);
+}
+vec4 sampleRect(vec4 rect, vec2 uv, vec4 fallbackValue) {
+    return hasRect(rect) ? texture(materialAtlas, atlasCoordinate(rect, uv)) : fallbackValue;
+}
+
+// Explicit-LOD variant, for sampling inside a ray-query traversal loop.
+//
+// texture() picks its mip from screen-space derivatives, which are only defined
+// when a quad's four pixels are in uniform control flow. Inside a
+// rayQueryProceedEXT loop they never are: neighbouring pixels are at different
+// candidates on different primitives, so the derivatives are meaningless and
+// the mip level is formally undefined. Each pixel then reads a different mip of
+// the same texture and makes a different alpha-test decision, which is what
+// turned a chicken-wire fence into salt-and-pepper instead of a clean pattern.
+//
+// Mip 0 is also the correct level on the merits: alpha coverage is a geometric
+// property of the texture, and averaging it down a mip chain dissolves thin
+// alpha-tested detail. metal/chicken_wire001 has a mean alpha of 23/255 against
+// a 0.25 reference, so any mip above the first tests as entirely hole.
+vec4 sampleRectLod0(vec4 rect, vec2 uv, vec4 fallbackValue) {
+    return hasRect(rect) ? textureLod(materialAtlas, atlasCoordinate(rect, uv), 0.0)
+                         : fallbackValue;
+}
+
+vec3 sampleCubeRects(vec4 rects[6], vec3 direction, vec3 fallbackColor) {
+    vec3 d = normalize(direction);
+    vec3 a = abs(d);
+    int face = 0;
+    vec2 uv = vec2(0.5);
+    if (a.x >= a.y && a.x >= a.z) {
+        if (d.x >= 0.0) { face = 0; uv = vec2(-d.y, -d.z) / a.x; }
+        else            { face = 1; uv = vec2( d.y, -d.z) / a.x; }
+    } else if (a.y >= a.z) {
+        if (d.y >= 0.0) { face = 2; uv = vec2( d.x, -d.z) / a.y; }
+        else            { face = 3; uv = vec2(-d.x, -d.z) / a.y; }
+    } else {
+        if (d.z >= 0.0) { face = 4; uv = vec2( d.x,  d.y) / a.z; }
+        else            { face = 5; uv = vec2( d.x, -d.y) / a.z; }
+    }
+    uv = uv * 0.5 + 0.5;
+    // Atlas colour textures are stored as UNORM. Decode sampled sky/cubemap
+    // texels here so all lighting and reflection composition remains linear.
+    return hasRect(rects[face])
+        ? sourceGammaToLinear(sampleRect(rects[face], uv, vec4(0.0, 0.0, 0.0, 1.0)).rgb)
+        : fallbackColor;
+}
+
+vec3 sampleSky(vec3 direction) {
+    vec4 rects[6];
+    for (int i = 0; i < 6; ++i) rects[i] = cameraData.skyRects[i];
+    float horizon = clamp(direction.z * 0.5 + 0.5, 0.0, 1.0);
+    vec3 procedural = mix(cameraData.backgroundColor.rgb * 0.65,
+                          max(cameraData.backgroundColor.rgb, vec3(0.24, 0.31, 0.42)),
+                          horizon);
+    return sampleCubeRects(rects, direction, procedural);
+}
+
+void triangleData(uint primitive, vec2 bary, out VertexRecord a, out VertexRecord b,
+                  out VertexRecord c, out vec3 weights) {
+    uint first = primitive * 3u;
+    a = vertices[indices[first + 0u]];
+    b = vertices[indices[first + 1u]];
+    c = vertices[indices[first + 2u]];
+    weights = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+}
+
+vec4 baseSampleForCandidate(uint primitive, vec2 bary) {
+    VertexRecord a, b, c;
+    vec3 w;
+    triangleData(primitive, bary, a, b, c, w);
+    uint materialIndex = triangles[primitive].data.x;
+    MaterialRecord material = materials[materialIndex];
+    vec2 uv = a.texCoord.xy * w.x + b.texCoord.xy * w.y + c.texCoord.xy * w.z;
+    vec2 uv2 = a.texCoord.zw * w.x + b.texCoord.zw * w.y + c.texCoord.zw * w.z;
+    float blend = a.surface.x * w.x + b.surface.x * w.y + c.surface.x * w.z;
+    // Explicit LOD: this runs inside ray-query traversal, where implicit
+    // derivatives are undefined. See sampleRectLod0.
+    vec4 base = sampleRectLod0(material.baseRect, uv, vec4(1.0, 0.0, 1.0, 1.0));
+    if ((material.flags.x & RT_HAS_SECONDARY) != 0u)
+        base = mix(base, sampleRectLod0(material.secondaryRect, uv2, base),
+                   clamp(blend, 0.0, 1.0));
+    return base;
+}
+
+// Source only treats base-texture alpha as coverage when the VMT asks for it.
+// Opaque materials commonly store phong/envmap/tint masks in alpha, so using
+// incidental VTF alpha as geometry coverage incorrectly punches holes in them.
+float materialCoverage(MaterialRecord material, vec4 base, uint triangleFlags) {
+    if ((material.flags.x & RT_WATER) != 0u) return 1.0;
+    // Hammer's point-entity sprite helper path always blends the source image
+    // alpha, even when the helper VMT itself does not declare $translucent.
+    if ((triangleFlags & TRIANGLE_SPRITE) != 0u)
+        return clamp(base.a * material.transparencyControls.x, 0.0, 1.0);
+    if ((material.flags.y & RT2_ALPHA_TEST) == 0u &&
+        (material.flags.x & RT_TRANSLUCENT) == 0u) return 1.0;
+    return clamp(base.a * material.transparencyControls.x, 0.0, 1.0);
+}
+
+bool candidateHasCoverage(MaterialRecord material, vec4 base, uint triangleFlags) {
+    float coverage = materialCoverage(material, base, triangleFlags);
+    if ((triangleFlags & TRIANGLE_SPRITE) != 0u) return coverage >= 0.005;
+    if ((material.flags.y & RT2_ALPHA_TEST) != 0u)
+        return coverage >= clamp(material.detailAlphaControls.w, 0.0, 1.0);
+    if ((material.flags.x & RT_TRANSLUCENT) != 0u) return coverage >= 0.005;
+    return true;
+}
+
+float candidateOpacity(MaterialRecord material, vec4 base, uint triangleFlags) {
+    if ((triangleFlags & TRIANGLE_SPRITE) != 0u)
+        return materialCoverage(material, base, triangleFlags);
+    if ((material.flags.y & RT2_ALPHA_TEST) != 0u) return 1.0;
+    if ((material.flags.x & RT_TRANSLUCENT) != 0u)
+        return materialCoverage(material, base, triangleFlags);
+    return 1.0;
+}
+
+HitRecord traceScene(vec3 origin, vec3 direction, float minimumDistance, float maximumDistance) {
+    HitRecord result;
+    result.hit = false;
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, sceneAccelerationStructure, gl_RayFlagsNoneEXT,
+                          0xffu, origin, minimumDistance, direction, maximumDistance);
+    while (rayQueryProceedEXT(query)) {
+        if (rayQueryGetIntersectionTypeEXT(query, false) !=
+            gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+        uint primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, false);
+        uint triangleFlags = triangles[primitive].data.y;
+        if ((triangleFlags & TRIANGLE_NO_PRIMARY) != 0u) continue;
+        bool frontFace = rayQueryGetIntersectionFrontFaceEXT(query, false);
+        if (!frontFace && (triangleFlags & TRIANGLE_TWO_SIDED) == 0u) continue;
+        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, false);
+        vec4 base = baseSampleForCandidate(primitive, bary);
+        MaterialRecord material = materials[triangles[primitive].data.x];
+        if (!candidateHasCoverage(material, base, triangleFlags)) continue;
+        rayQueryConfirmIntersectionEXT(query);
+    }
+    if (rayQueryGetIntersectionTypeEXT(query, true) !=
+        gl_RayQueryCommittedIntersectionTriangleEXT) return result;
+
+    result.hit = true;
+    result.distance = rayQueryGetIntersectionTEXT(query, true);
+    result.primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+    result.material = triangles[result.primitive].data.x;
+    result.frontFace = rayQueryGetIntersectionFrontFaceEXT(query, true);
+    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, true);
+    VertexRecord a, b, c;
+    vec3 w;
+    triangleData(result.primitive, bary, a, b, c, w);
+    result.position = origin + direction * result.distance;
+
+    // The RT scene intentionally reverses submitted triangle winding to match
+    // Vulkan's visibility convention, while VMF brush vertices retain Source's
+    // authored face normal.  Do not use rayQuery frontFace to orient the shading
+    // normal: for brushes those two conventions are not guaranteed to agree.
+    // Reconstruct the actual geometric normal and face it toward the incoming ray,
+    // then put the interpolated shading normal into the same hemisphere.
+    vec3 edge1 = b.position.xyz - a.position.xyz;
+    vec3 edge2 = c.position.xyz - a.position.xyz;
+    vec3 geometric = cross(edge1, edge2);
+    float geometricLength2 = dot(geometric, geometric);
+    if (geometricLength2 > 1e-12) geometric *= inversesqrt(geometricLength2);
+    else geometric = normalize(a.normal.xyz * w.x + b.normal.xyz * w.y + c.normal.xyz * w.z);
+    if (dot(geometric, direction) > 0.0) geometric = -geometric;
+    result.geometricNormal = geometric;
+
+    result.normal = normalize(a.normal.xyz * w.x + b.normal.xyz * w.y + c.normal.xyz * w.z);
+    vec4 interpolatedTangent = a.tangent * w.x + b.tangent * w.y + c.tangent * w.z;
+    // Degenerate UVs can interpolate to a zero-length tangent, and normalizing
+    // that is undefined - the NaN would reach the shading normal before
+    // materialNormal's own guard could reject it. Any finite direction will do:
+    // materialNormal orthogonalizes against the normal and falls back to the
+    // unperturbed normal when nothing usable survives.
+    float tangentLength2 = dot(interpolatedTangent.xyz, interpolatedTangent.xyz);
+    result.tangent = vec4(tangentLength2 > 1e-12
+                              ? interpolatedTangent.xyz * inversesqrt(tangentLength2)
+                              : vec3(1.0, 0.0, 0.0),
+                          interpolatedTangent.w < 0.0 ? -1.0 : 1.0);
+    if (dot(result.normal, result.geometricNormal) < 0.0) {
+        result.normal = -result.normal;
+        result.tangent.xyz = -result.tangent.xyz;
+    }
+    result.uv = a.texCoord.xy * w.x + b.texCoord.xy * w.y + c.texCoord.xy * w.z;
+    result.uv2 = a.texCoord.zw * w.x + b.texCoord.zw * w.y + c.texCoord.zw * w.z;
+    result.blend = a.surface.x * w.x + b.surface.x * w.y + c.surface.x * w.z;
+    result.weights = w;
+    return result;
+}
+
+vec3 surfaceRayOrigin(HitRecord hit, vec3 rayDirection) {
+    // Offset along the geometric side the secondary ray is actually entering.
+    // Offsetting along a bump/shading normal can place a ray back inside a brush
+    // and make the brush immediately shadow itself.
+    vec3 geometric = normalize(hit.geometricNormal);
+    float side = dot(geometric, rayDirection) >= 0.0 ? 1.0 : -1.0;
+    return hit.position + geometric * (0.06 * side);
+}
+
+struct LightBoundary {
+    bool hit;
+    bool sky;
+    float distance;
+    float opacity;
+};
+
+LightBoundary closestLightBoundary(vec3 origin, vec3 direction, float minimumDistance,
+                                   float maximumDistance, bool requireSkyPortal) {
+    LightBoundary result;
+    result.hit = false;
+    result.sky = false;
+    result.distance = maximumDistance;
+    result.opacity = 0.0;
+
+    if (minimumDistance >= maximumDistance) return result;
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, sceneAccelerationStructure, gl_RayFlagsNoneEXT, 0xffu,
+                          origin, minimumDistance, direction, maximumDistance);
+    while (rayQueryProceedEXT(query)) {
+        if (rayQueryGetIntersectionTypeEXT(query, false) !=
+            gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+        uint primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, false);
+        uint flags = triangles[primitive].data.y;
+        bool skyPortal = (flags & TRIANGLE_SKY) != 0u;
+        // Point-entity sprites, light helpers and ordinary tool helpers are visual
+        // editor geometry only.  Sky portals remain queryable for light_environment.
+        if ((flags & TRIANGLE_NO_SHADOW) != 0u && !(requireSkyPortal && skyPortal)) continue;
+        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, false);
+        MaterialRecord material = materials[triangles[primitive].data.x];
+        vec4 base = baseSampleForCandidate(primitive, bary);
+        if (!candidateHasCoverage(material, base, flags)) continue;
+        rayQueryConfirmIntersectionEXT(query);
+    }
+    if (rayQueryGetIntersectionTypeEXT(query, true) !=
+        gl_RayQueryCommittedIntersectionTriangleEXT) return result;
+
+    result.hit = true;
+    uint primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+    result.sky = (triangles[primitive].data.y & TRIANGLE_SKY) != 0u;
+    result.distance = rayQueryGetIntersectionTEXT(query, true);
+    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, true);
+    MaterialRecord material = materials[triangles[primitive].data.x];
+    result.opacity = candidateOpacity(material, baseSampleForCandidate(primitive, bary),
+                                      triangles[primitive].data.y);
+    return result;
+}
+
+// Advances past a hit along the ray without moving the ray's origin.
+//
+// Marching the origin forward by a fixed world distance is what made decals and
+// overlays leak. Projected surfaces are built one SurfaceOffset (0.04 units) in
+// front of the face they sit on, so any step larger than that jumps clean over
+// the wall behind them: a translucent decal texel would then see whatever lies
+// beyond the wall instead of the wall itself. Keeping the origin fixed and
+// raising the ray's minimum t instead makes the step as small as float
+// precision allows, and it scales with distance so a far surface still clears
+// its own hit.
+float advancedRayMinimum(float hitDistance) {
+    return hitDistance * 1.00001 + 0.002;
+}
+
+float lightTransmission(vec3 origin, vec3 direction, float maximumDistance,
+                        bool requireSkyPortal) {
+    float transmission = 1.0;
+    float travelled = 0.03;
+    // Walk multiple translucent panes front-to-back instead of treating glass as
+    // an opaque shadow caster. Alpha-tested texels remain binary, matching raster.
+    for (int layer = 0; layer < 4 && travelled < maximumDistance && transmission > 0.005;
+         ++layer) {
+        LightBoundary boundary = closestLightBoundary(origin, direction, travelled,
+                                                      maximumDistance, requireSkyPortal);
+        if (!boundary.hit) return requireSkyPortal ? 0.0 : transmission;
+        if (boundary.sky) return transmission;
+        if (boundary.opacity >= 0.999) return 0.0;
+        transmission *= 1.0 - clamp(boundary.opacity, 0.0, 1.0);
+        travelled = advancedRayMinimum(boundary.distance);
+    }
+    return requireSkyPortal ? 0.0 : transmission;
+}
+
+bool visibleToLight(vec3 origin, vec3 direction, float maximumDistance, bool requireSkyPortal) {
+    return lightTransmission(origin, direction, maximumDistance, requireSkyPortal) > 0.005;
+}
+
+uint hashValue(uvec3 value) {
+    value = value * 1664525u + 1013904223u;
+    value.x += value.y * value.z;
+    value.y += value.z * value.x;
+    value.z += value.x * value.y;
+    value ^= value >> 16u;
+    return value.x ^ value.y ^ value.z;
+}
+float randomFloat(inout uint state) {
+    state ^= state << 13u;
+    state ^= state >> 17u;
+    state ^= state << 5u;
+    return float(state) * (1.0 / 4294967296.0);
+}
+vec3 cosineHemisphere(vec3 normal, inout uint state) {
+    float r1 = randomFloat(state);
+    float r2 = randomFloat(state);
+    float angle = 6.28318530718 * r1;
+    float radius = sqrt(r2);
+    vec3 tangent = normalize(abs(normal.z) < 0.999 ? cross(normal, vec3(0.0, 0.0, 1.0))
+                                                   : cross(normal, vec3(0.0, 1.0, 0.0)));
+    vec3 bitangent = cross(normal, tangent);
+    return normalize(tangent * (cos(angle) * radius) + bitangent * (sin(angle) * radius) +
+                     normal * sqrt(max(0.0, 1.0 - r2)));
+}
+
+// ---------------------------------------------------------------------------
+// Bounced light, read from the VRAD radiosity patch grid.
+//
+// This replaces the constant ambient the preview used to add. The solve itself
+// is VRAD's: patches gather form-factor weighted transfers from every patch
+// they can see and iterate B = E + p*sum(B*F), so what comes back carries the
+// colour of whatever bounced it - the thing a constant ambient term can never
+// produce.
+//
+// The grid is coarse on purpose. Indirect light is low frequency, so reading it
+// with a bilinear tap per pixel costs one buffer fetch and no rays, which is
+// what keeps this within the existing frame budget. Direct light stays per
+// pixel; only the bounce comes from here.
+// ---------------------------------------------------------------------------
+
+// World position -> patch coordinate on a known face. Mirrors rectTexel.
+vec2 patchTexel(RectRecord record, vec3 position) {
+    float scale = max(record.origin.z, 1e-4);
+    float s = (dot(position, record.uAxis.xyz) + record.uAxis.w) / scale - record.origin.x;
+    float t = (dot(position, record.vAxis.xyz) + record.vAxis.w) / scale - record.origin.y;
+    return vec2(clamp(s, 0.0, record.rect.z - 1.0), clamp(t, 0.0, record.rect.w - 1.0));
+}
+
+// The world-space extent of one luxel on this surface, as two tangent vectors.
+//
+// A compiled map stores direct light on this grid, so a shadow edge there fades
+// across roughly one luxel rather than ending on a pixel boundary. Returns
+// false for anything with no lightmap, which keeps props and tool surfaces on
+// the crisp per-pixel path.
+bool luxelFootprint(uint primitive, out vec3 uStep, out vec3 vStep) {
+    uStep = vec3(0.0);
+    vStep = vec3(0.0);
+    if (cameraData.radiosityControls.z == 0u) return false;
+    if ((triangles[primitive].data.y & TRIANGLE_HAS_LIGHTMAP) == 0u) return false;
+    // A displacement's luxel axes belong to the base face's plane, not to the
+    // displaced surface. Stepping half a luxel along them walks the shadow ray
+    // origin off the terrain - into the next dune on anything sloped - and the
+    // resulting mis-shadowed samples land in triangle-shaped patches, since
+    // whether the step lands inside the surface follows the tessellation. Keep
+    // displacements on the single-ray path they used before supersampling.
+    if ((triangles[primitive].data.y & TRIANGLE_DISPLACEMENT) != 0u) return false;
+    RectRecord record = patchRects[triangles[primitive].data.z];
+    // origin.w is the face's luxel scale; origin.z is the coarser patch scale.
+    float luxelScale = record.origin.w > 0.0 ? record.origin.w : record.origin.z;
+    if (luxelScale <= 0.0) return false;
+    uStep = normalize(record.uAxis.xyz) * luxelScale;
+    vStep = normalize(record.vAxis.xyz) * luxelScale;
+    return true;
+}
+
+vec3 radiosityAt(uint primitive, vec3 position) {
+    if (cameraData.radiosityControls.z == 0u) return vec3(0.0);
+    if ((triangles[primitive].data.y & TRIANGLE_HAS_LIGHTMAP) == 0u) return vec3(0.0);
+    RectRecord record = patchRects[triangles[primitive].data.z];
+    vec2 texel = patchTexel(record, position);
+    vec2 corner = floor(texel - 0.5) + 0.5;
+    vec2 fraction = clamp(texel - corner, 0.0, 1.0);
+
+    uvec2 atlasSize = cameraData.radiosityControls.xy;
+    vec3 accumulated = vec3(0.0);
+    float total = 0.0;
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            vec2 local = clamp(corner + vec2(x, y), vec2(0.0), record.rect.zw - 1.0);
+            ivec2 atlas = ivec2(record.rect.xy + floor(local));
+            if (atlas.x < 0 || atlas.y < 0 ||
+                atlas.x >= int(atlasSize.x) || atlas.y >= int(atlasSize.y)) continue;
+            uint stored = patchIndexGrid[uint(atlas.y) * atlasSize.x + uint(atlas.x)];
+            if (stored == 0u) continue;
+            float weight = (x == 0 ? 1.0 - fraction.x : fraction.x) *
+                           (y == 0 ? 1.0 - fraction.y : fraction.y);
+            if (weight <= 0.0) continue;
+            accumulated += patchTotal[stored - 1u].rgb * weight;
+            total += weight;
+        }
+    }
+    return total > 0.0 ? accumulated / total : vec3(0.0);
+}
+
+// Source's ambient-cube reconstruction: the squared normal components pick and
+// weight three of the six axes. Taking the normal at shading time is what lets a
+// normal map still modulate baked prop light.
+vec3 evaluatePropCube(uint slot, vec3 normal) {
+    vec3 squared = normal * normal;
+    uint base = slot * 6u;
+    return propCube[base + (normal.x > 0.0 ? 0u : 1u)].rgb * squared.x +
+           propCube[base + (normal.y > 0.0 ? 2u : 3u)].rgb * squared.y +
+           propCube[base + (normal.z > 0.0 ? 4u : 5u)].rgb * squared.z;
+}
+
+// Bounced light on a static prop, interpolated across the triangle from the
+// three corner cubes the bake solved. Returns false for anything that is not a
+// baked prop so the caller can keep its ambient approximation.
+bool propRadiosity(HitRecord hit, vec3 normal, out vec3 indirect) {
+    indirect = vec3(0.0);
+    if (cameraData.radiosityControls.w == 0u) return false;
+    uint slot = triangles[hit.primitive].data.w;
+    if (slot == 0xffffffffu) return false;
+    uint base = slot * 3u;
+    // Alpha is the bake's "this corner was solved" mark.
+    if (propCube[base * 6u].a <= 0.0) return false;
+    indirect = evaluatePropCube(base + 0u, normal) * hit.weights.x +
+               evaluatePropCube(base + 1u, normal) * hit.weights.y +
+               evaluatePropCube(base + 2u, normal) * hit.weights.z;
+    return true;
+}
+
+vec4 applyDetail(MaterialRecord material, vec2 uv, vec4 base) {
+    if ((material.flags.y & RT2_HAS_DETAIL) == 0u) return base;
+    vec4 detail = sampleRect(material.detailRect, uv * material.detailAlphaControls.x,
+                             vec4(0.5, 0.5, 0.5, 1.0));
+    float factor = material.detailAlphaControls.y;
+    int mode = int(material.detailAlphaControls.z + 0.5);
+    if (mode == 1) base.rgb += detail.rgb * factor;
+    else if (mode == 2) base.rgb = mix(base.rgb, detail.rgb, clamp(detail.a * factor, 0.0, 1.0));
+    else if (mode == 5) base.rgb *= mix(vec3(1.0), detail.rgb * 2.0, clamp(factor, 0.0, 1.0));
+    else if (mode == 6) base.rgb += detail.rgb * detail.a * factor;
+    else base.rgb *= mix(vec3(1.0), detail.rgb * 2.0, clamp(factor, 0.0, 1.0));
+    return base;
+}
+
+// Normal mapping: $bumpmap names a texture whose RGB holds tangent-space
+// normal vectors, not a height field, so this perturbs the shading normal
+// rather than displacing anything. The key name is legacy; the identifiers
+// below keep it only because they mirror the VMT key.
+//
+// Mirrors the OpenGL viewport's equivalent block. The two viewports have to
+// agree texel for texel, so the operation order here is deliberate rather than
+// merely equivalent.
+vec3 materialNormal(MaterialRecord material, HitRecord hit, out float normalAlpha) {
+    vec3 n = normalize(hit.normal);
+    normalAlpha = 1.0;
+    if ((material.flags.x & RT_HAS_BUMP) == 0u) return n;
+
+    vec4 normalSample = sampleRect(material.bumpRect, hit.uv, vec4(0.5, 0.5, 1.0, 1.0));
+    // GL keeps two separate uniforms: uHasBumpMap (the texture is bound, so its
+    // alpha is available as a Phong/envmap mask) and uUseBumpMap (perturbation
+    // is switched on). Collapsing them meant turning the bump-map toggle off
+    // also silently dropped every normal-alpha mask, which GL does not do.
+    normalAlpha = normalSample.a;
+    if ((cameraData.renderControls.z & CONTROL_BUMP) == 0u) return n;
+
+    vec3 tangent = hit.tangent.xyz - n * dot(n, hit.tangent.xyz);
+    // A degenerate tangent - collapsed UVs, or a tangent that came in parallel
+    // to the normal - cannot define a frame. GL falls back to the unperturbed
+    // normal here rather than normalizing a zero vector.
+    float orthogonalLength = length(tangent);
+    if (orthogonalLength <= 0.05) return n;
+    tangent /= orthogonalLength;
+    vec3 bitangent = normalize(cross(n, tangent)) * (hit.tangent.w < 0.0 ? -1.0 : 1.0);
+
+    vec3 tangentNormal = normalSample.xyz * 2.0 - 1.0;
+    tangentNormal.xy *= clamp(cameraData.effectIntensities.z, 0.0, 4.0);
+    // The Z floor is applied AFTER the XY scale and BEFORE normalizing, as in
+    // GL. Without it a strength above 1 tips the normal toward - and past - the
+    // tangent plane, which is what made the RT preview's bump read far harsher
+    // and darker than the same material under OpenGL.
+    tangentNormal.z = max(tangentNormal.z, 0.06);
+    tangentNormal = normalize(tangentNormal);
+
+    return normalize(tangent * tangentNormal.x + bitangent * tangentNormal.y + n * tangentNormal.z);
+}
+
+vec4 baseMaterialSample(MaterialRecord material, HitRecord hit) {
+    vec4 base = sampleRect(material.baseRect, hit.uv, vec4(1.0, 0.0, 1.0, 1.0));
+    if ((material.flags.x & RT_HAS_SECONDARY) != 0u)
+        base = mix(base, sampleRect(material.secondaryRect, hit.uv2, base), clamp(hit.blend, 0.0, 1.0));
+    base = applyDetail(material, hit.uv, base);
+
+    // Base/detail atlas texels and VMT tint values are authored in display
+    // space. Shade their linear values; gamma-encoded albedo multiplied by a
+    // strong final exposure was the main fullbright/washout path.
+    base.rgb = sourceGammaToLinear(max(base.rgb, vec3(0.0)));
+    if ((material.flags.x & RT_COLOR2) != 0u) {
+        vec3 color2 = sourceGammaToLinear(max(material.color2.rgb, vec3(0.0)));
+        vec3 tinted = base.rgb * color2;
+        if ((material.flags.x & RT_BLEND_TINT_BASE_ALPHA) != 0u) {
+            vec3 replacement = mix(tinted, color2, material.color2.a);
+            base.rgb = mix(base.rgb, replacement, base.a);
+        } else {
+            base.rgb = tinted;
+        }
+    }
+    return base;
+}
+
+float sourceDiffuse(MaterialRecord material, float ndotl) {
+    if ((material.flags.x & RT_HALF_LAMBERT) != 0u) {
+        float halfLambert = clamp(ndotl * 0.5 + 0.5, 0.0, 1.0);
+        if ((material.flags.x & RT_HAS_LIGHTWARP) != 0u &&
+            (cameraData.renderControls.z & CONTROL_LIGHTWARP) != 0u)
+            return halfLambert;
+        return halfLambert * halfLambert;
+    }
+    return max(ndotl, 0.0);
+}
+
+vec3 warpedDiffuse(MaterialRecord material, float diffuse) {
+    if ((material.flags.x & RT_HAS_LIGHTWARP) == 0u ||
+        (cameraData.renderControls.z & CONTROL_LIGHTWARP) == 0u)
+        return vec3(diffuse);
+    // $lightwarptexture replaces the local diffuse response. It is sampled
+    // without sRGB conversion and must not receive a second overbright factor.
+    return sampleRect(material.lightWarpRect,
+                      vec2(clamp(diffuse, 0.0, 1.0), 0.5),
+                      vec4(diffuse)).rgb * 2.0;
+}
+
+
+bool evaluateMapLight(LightRecord light, vec3 position, out vec3 direction,
+                      out float maximumDistance, out vec3 radiance, out bool requireSkyPortal,
+                      out float sunExtent) {
+    int type=int(light.positionType.w+0.5);
+    sunExtent=0.0;
+    if (type==3) return false;
+    requireSkyPortal=(type==4);
+    float attenuation=1.0;
+    if (type==2 || type==4) {
+        direction=normalize(-light.directionRange.xyz);
+        maximumDistance=131072.0;
+        sunExtent=light.innerControls.z;
+    } else {
+        vec3 delta=light.positionType.xyz-position;
+        float distanceToLight=length(delta);
+        if (distanceToLight<0.001 ||
+            (light.directionRange.w>0.0 && distanceToLight>light.directionRange.w)) return false;
+        direction=delta/distanceToLight;
+        maximumDistance=max(distanceToLight-0.06,0.02);
+        // Same falloff VRAD bakes into the lightmap, including the cap distance
+        // and the fade a _fifty_percent_distance light gets. A smoothstep cone
+        // ramp was close but not Source's: VRAD ramps linearly in cos(angle)
+        // and then raises that to _exponent, so a spot's penumbra sat in a
+        // visibly different place in the preview than in a compiled map.
+        // dist = max(dist, 1) before the cap, matching VRAD. Intensity is
+        // pre-scaled by (c + 100l + 10000q), so dropping this floor makes a
+        // surface within a unit of a quadratic light blow out to white.
+        float evaluated=max(distanceToLight,1.0);
+        float capped=min(evaluated,max(light.fadeControls.x,1.0));
+        float denominator=light.attenuationOuter.x+light.attenuationOuter.y*capped+
+                          light.attenuationOuter.z*capped*capped;
+        attenuation=1.0/max(denominator,0.0001);
+        float startFade=light.fadeControls.y;
+        float endFade=light.fadeControls.z;
+        if (endFade>startFade) {
+            if (evaluated>=endFade) return false;
+            float t=1.0-clamp((evaluated-startFade)/max(endFade-startFade,1e-6),0.0,1.0);
+            attenuation*=t*t*t*(t*(t*6.0-15.0)+10.0);
+        }
+        if (type==1) {
+            float stopdot2=light.attenuationOuter.w;
+            float stopdot=light.innerControls.x;
+            float alignment=dot(normalize(light.directionRange.xyz),-direction);
+            if (alignment<=stopdot2) return false;
+            // GatherSampleLightSSE multiplies a spotlight's falloff by this
+            // cosine across the whole cone, before the fringe ramp - without it
+            // the pool of light reads flat and too bright off the axis.
+            attenuation*=alignment;
+            if (alignment<stopdot) {
+                float ramp=clamp((alignment-stopdot2)/max(stopdot-stopdot2,1e-6),0.0,1.0);
+                float exponent=light.innerControls.y;
+                if (exponent!=0.0 && exponent!=1.0) ramp=pow(ramp,exponent);
+                attenuation*=ramp;
+            }
+        }
+    }
+    radiance=light.colorIntensity.rgb*light.colorIntensity.w*attenuation;
+    // Magnitude, not sign. A negative BrightnessScaleHDR is documented as
+    // subtracting the light it would otherwise cast, so a light whose radiance
+    // is negative still has to be traced and shaded - testing for a positive
+    // value here dropped those lights entirely instead of darkening with them.
+    return max(max(abs(radiance.r),abs(radiance.g)),abs(radiance.b))>0.000001;
+}
+vec3 mapEnvironmentAmbient() {
+    vec3 ambient=vec3(0.0);
+    for (uint i=0u;i<mapLights.length();++i)
+        if (int(mapLights[i].positionType.w+0.5)==3)
+            ambient+=mapLights[i].colorIntensity.rgb*mapLights[i].colorIntensity.w;
+    // Hammer approximates _ambient as many evenly distributed directional
+    // lights. The cosine-weighted response of that sphere is one quarter of
+    // the authored colour, not an unmodulated fullbright add.
+    return ambient * 0.25;
+}
+
+vec3 simpleSecondaryColor(HitRecord hit, vec3 rayDirection) {
+    if (!hit.hit) return sampleSky(rayDirection);
+    MaterialRecord material = materials[hit.material];
+    vec4 base = baseMaterialSample(material, hit);
+    float normalAlpha;
+    vec3 normal = materialNormal(material, hit, normalAlpha);
+    vec3 direct=vec3(0.0);
+    const int MAX_SECONDARY_LIGHTS = 2;
+    vec3 selectedDirections[MAX_SECONDARY_LIGHTS];
+    vec3 selectedRadiance[MAX_SECONDARY_LIGHTS];
+    float selectedDistances[MAX_SECONDARY_LIGHTS];
+    float selectedDiffuse[MAX_SECONDARY_LIGHTS];
+    bool selectedRequireSkyPortal[MAX_SECONDARY_LIGHTS];
+    float selectedEnergy[MAX_SECONDARY_LIGHTS];
+    for (int slot=0; slot<MAX_SECONDARY_LIGHTS; ++slot) selectedEnergy[slot]=0.0;
+    for (uint i=0u;i<mapLights.length();++i) {
+        vec3 lightDirection,radiance; float maximumDistance; bool requireSkyPortal; float sunExtent;
+        if (!evaluateMapLight(mapLights[i],hit.position,lightDirection,maximumDistance,radiance,requireSkyPortal,sunExtent)) continue;
+        float diffuse=max(dot(normal,lightDirection),0.0);
+        if (diffuse<=0.0) continue;
+        float energy=max(max(abs(radiance.r),abs(radiance.g)),abs(radiance.b))*diffuse;
+        int insertAt=-1;
+        for (int slot=0; slot<MAX_SECONDARY_LIGHTS; ++slot) {
+            if (energy>selectedEnergy[slot]) { insertAt=slot; break; }
+        }
+        if (insertAt<0) continue;
+        for (int slot=MAX_SECONDARY_LIGHTS-1; slot>insertAt; --slot) {
+            selectedEnergy[slot]=selectedEnergy[slot-1];
+            selectedDirections[slot]=selectedDirections[slot-1];
+            selectedRadiance[slot]=selectedRadiance[slot-1];
+            selectedDistances[slot]=selectedDistances[slot-1];
+            selectedDiffuse[slot]=selectedDiffuse[slot-1];
+            selectedRequireSkyPortal[slot]=selectedRequireSkyPortal[slot-1];
+        }
+        selectedEnergy[insertAt]=energy;
+        selectedDirections[insertAt]=lightDirection;
+        selectedRadiance[insertAt]=radiance;
+        selectedDistances[insertAt]=maximumDistance;
+        selectedDiffuse[insertAt]=diffuse;
+        selectedRequireSkyPortal[insertAt]=requireSkyPortal;
+    }
+    for (int slot=0; slot<MAX_SECONDARY_LIGHTS; ++slot) {
+        if (selectedEnergy[slot]<=0.0) continue;
+        float transmission = lightTransmission(surfaceRayOrigin(hit, selectedDirections[slot]),
+                                                selectedDirections[slot], selectedDistances[slot],
+                                                selectedRequireSkyPortal[slot]);
+        direct += selectedRadiance[slot] * selectedDiffuse[slot] * transmission;
+    }
+    // _ambient is skylight from the same environment entity, so do not let it
+    // leak into a sealed room. A deterministic upward-biased sky probe keeps
+    // secondary rays stable while approximating Source's hemispherical sky fill.
+    vec3 skyProbeDirection=normalize(normal*0.35+vec3(0.0,0.0,1.0));
+    float environmentTransmission = lightTransmission(surfaceRayOrigin(hit, skyProbeDirection),
+                                                     skyProbeDirection, 131072.0, true);
+    vec3 environmentAmbient = mapEnvironmentAmbient() * environmentTransmission;
+    return base.rgb * (vec3(0.18) + environmentAmbient + direct) +
+           ((material.flags.x & RT_SELFILLUM) != 0u ? base.rgb * base.a : vec3(0.0));
+}
+
+vec3 shadeWater(MaterialRecord material, HitRecord hit, vec3 rayDirection, vec3 viewDirection,
+                uint randomState) {
+    vec2 uv = hit.uv * material.waterScaleScroll1.xy;
+    float time = cameraData.sunColorTime.w;
+    vec2 flow = vec2(0.0);
+    if ((material.flags.x & RT_HAS_FLOW) != 0u) {
+        flow = sampleRect(material.flowRect, hit.uv * material.waterFlow.y,
+                          vec4(0.5, 0.5, 0.0, 1.0)).rg * 2.0 - 1.0;
+    }
+    vec2 scroll1 = material.waterScaleScroll1.zw * time;
+    vec2 scroll2 = material.waterScroll2NormalCycle.xy * time;
+    float cycle = fract(time * material.waterScroll2NormalCycle.w);
+    vec2 flowOffset = flow * material.waterFlow.x;
+    vec3 normal1 = sampleRect(material.bumpRect, uv * material.waterFlow.z + scroll1 + flowOffset * cycle,
+                              vec4(0.5, 0.5, 1.0, 1.0)).xyz * 2.0 - 1.0;
+    vec3 normal2 = sampleRect(material.bumpRect, uv * material.waterFlow.z + scroll2 - flowOffset * (1.0 - cycle),
+                              vec4(0.5, 0.5, 1.0, 1.0)).xyz * 2.0 - 1.0;
+    vec3 tangentNormal = normalize(mix(normal1, normal2, smoothstep(0.0, 1.0, cycle)));
+    vec3 geometric = normalize(hit.normal);
+    vec3 tangent = normalize(hit.tangent.xyz - geometric * dot(geometric, hit.tangent.xyz));
+    vec3 bitangent = normalize(cross(geometric, tangent)) * hit.tangent.w;
+    vec3 normal = normalize(tangent * tangentNormal.x * material.waterScroll2NormalCycle.z +
+                            bitangent * tangentNormal.y * material.waterScroll2NormalCycle.z +
+                            geometric * tangentNormal.z);
+    float ndotv = clamp(dot(normal, viewDirection), 0.0, 1.0);
+    float fresnel = (material.flags.x & RT_WATER_NO_FRESNEL) != 0u
+        ? material.waterControls.x
+        : material.waterControls.x + (1.0 - material.waterControls.x) * pow(1.0 - ndotv, 5.0);
+
+    vec3 reflectedDirection = reflect(rayDirection, normal);
+    HitRecord reflectedHit = traceScene(hit.position + normal * 0.05, reflectedDirection, 0.02, 65536.0);
+    vec3 reflected = simpleSecondaryColor(reflectedHit, reflectedDirection) *
+                     material.waterReflectAmount.rgb * material.waterReflectAmount.w;
+
+    float eta = 1.0 / 1.333;
+    vec3 refractedDirection = refract(rayDirection, normal, eta);
+    if (dot(refractedDirection, refractedDirection) < 0.001) refractedDirection = rayDirection;
+    HitRecord refractedHit = traceScene(hit.position - normal * 0.05, refractedDirection, 0.02, 8192.0);
+    vec3 refracted = simpleSecondaryColor(refractedHit, refractedDirection) *
+                     material.waterRefractAmount.rgb;
+    if (refractedHit.hit) {
+        float fogRange = max(material.waterControls.w - material.waterControls.z, 1.0);
+        float fog = clamp((refractedHit.distance - material.waterControls.z) / fogRange, 0.0, 1.0);
+        refracted = mix(refracted, material.waterFogAlpha.rgb, fog);
+    } else {
+        refracted = mix(refracted, material.waterFogAlpha.rgb, 0.35);
+    }
+    return mix(refracted * max(material.waterRefractAmount.w, 0.35), reflected,
+               clamp(fresnel * material.waterControls.y, 0.0, 1.0));
+}
+
+float surfaceOpacity(HitRecord hit) {
+    MaterialRecord material = materials[hit.material];
+    return candidateOpacity(material, baseMaterialSample(material, hit),
+                            triangles[hit.primitive].data.y);
+}
+
+vec3 shadeSurface(HitRecord hit, vec3 rayDirection, inout uint randomState) {
+    MaterialRecord material = materials[hit.material];
+    vec4 base = baseMaterialSample(material, hit);
+    vec3 viewDirection = normalize(-rayDirection);
+
+    if ((material.flags.x & RT_WATER) != 0u)
+        return shadeWater(material, hit, rayDirection, viewDirection, randomState);
+
+    // Point-entity sprites and models/editor helper models are unlit editor
+    // helpers in the normal renderer. Preserve their authored color and let the
+    // main layered compositor apply texture alpha instead of turning
+    // transparent texels into black quads. A helper is a handle for the mapper,
+    // so it must not pick up the map's lighting any more than it casts it.
+    if ((triangles[hit.primitive].data.y & (TRIANGLE_SPRITE | TRIANGLE_UNLIT)) != 0u)
+        return base.rgb;
+
+    float normalAlpha;
+    vec3 normal = materialNormal(material, hit, normalAlpha);
+    // Keep only the strongest contributors that materially affect this pixel.
+    // Ray-query shadow tests dominate cost, so this is a budget rather than a
+    // model: VRAD sums every light in the map. Four was too few for a TF2 map -
+    // plr_hightower has 187 worldlights, and a single lamp fixture there is a
+    // spot plus a point light, so two fixtures alone exhausted the budget and
+    // the rest of the room's lights popped in and out along hard edges as the
+    // ranking changed from pixel to pixel.
+    const int MAX_SHADED_LIGHTS = 8;
+    const int INTERACTIVE_SHADED_LIGHTS = 4;
+    vec3 selectedDirections[MAX_SHADED_LIGHTS];
+    vec3 selectedRadiance[MAX_SHADED_LIGHTS];
+    float selectedDistances[MAX_SHADED_LIGHTS];
+    float selectedDiffuse[MAX_SHADED_LIGHTS];
+    bool selectedRequireSkyPortal[MAX_SHADED_LIGHTS];
+    float selectedSunExtent[MAX_SHADED_LIGHTS];
+    float selectedEnergy[MAX_SHADED_LIGHTS];
+    for (int slot=0; slot<MAX_SHADED_LIGHTS; ++slot) selectedEnergy[slot]=0.0;
+    // The sun gets a reserved slot rather than competing on energy.
+    //
+    // A point or spot light's intensity is pre-scaled by (c + 100l + 10000q),
+    // so a lamp a few units away outranks the sun by orders of magnitude: in
+    // plr_hightower the lamp spot scores ~11.8 against the sun's 2.9. Ranked
+    // purely on energy the sun is evicted everywhere a lamp is near, which
+    // silently drops both its light and its SunSpreadAngle penumbra - the one
+    // soft-edged shadow in the frame - and leaves only hard-edged lamp pools.
+    // It is one light and it reaches almost every surface, so it keeps a seat.
+    vec3 sunDirection=vec3(0.0), sunRadiance=vec3(0.0);
+    float sunDistance=0.0, sunDiffuse=0.0, sunExtentSelected=0.0, sunEnergy=0.0;
+    bool sunRequireSkyPortal=false;
+    for (uint i=0u;i<mapLights.length();++i) {
+        vec3 lightDirection,radiance; float maximumDistance; bool requireSkyPortal; float sunExtent;
+        if (!evaluateMapLight(mapLights[i],hit.position,lightDirection,maximumDistance,radiance,requireSkyPortal,sunExtent)) continue;
+        float diffuseTerm=sourceDiffuse(material,dot(normal,lightDirection));
+        if (diffuseTerm<=0.0) continue;
+        float energy=max(max(abs(radiance.r),abs(radiance.g)),abs(radiance.b))*diffuseTerm;
+        int type=int(mapLights[i].positionType.w+0.5);
+        if (type==2 || type==4) {
+            // Directional: light_environment's sun, or the fallback sun a map
+            // without one gets. Brightest wins if a map somehow has several.
+            if (energy>sunEnergy) {
+                sunEnergy=energy;
+                sunDirection=lightDirection;
+                sunRadiance=radiance;
+                sunDistance=maximumDistance;
+                sunDiffuse=diffuseTerm;
+                sunRequireSkyPortal=requireSkyPortal;
+                sunExtentSelected=sunExtent;
+            }
+            continue;
+        }
+        int insertAt=-1;
+        for (int slot=0; slot<MAX_SHADED_LIGHTS; ++slot) {
+            if (energy>selectedEnergy[slot]) { insertAt=slot; break; }
+        }
+        if (insertAt<0) continue;
+        for (int slot=MAX_SHADED_LIGHTS-1; slot>insertAt; --slot) {
+            selectedEnergy[slot]=selectedEnergy[slot-1];
+            selectedDirections[slot]=selectedDirections[slot-1];
+            selectedRadiance[slot]=selectedRadiance[slot-1];
+            selectedDistances[slot]=selectedDistances[slot-1];
+            selectedDiffuse[slot]=selectedDiffuse[slot-1];
+            selectedRequireSkyPortal[slot]=selectedRequireSkyPortal[slot-1];
+            selectedSunExtent[slot]=selectedSunExtent[slot-1];
+        }
+        selectedEnergy[insertAt]=energy;
+        selectedDirections[insertAt]=lightDirection;
+        selectedRadiance[insertAt]=radiance;
+        selectedDistances[insertAt]=maximumDistance;
+        selectedDiffuse[insertAt]=diffuseTerm;
+        selectedRequireSkyPortal[insertAt]=requireSkyPortal;
+        selectedSunExtent[insertAt]=sunExtent;
+    }
+    // Put the sun in slot 0, pushing the weakest local light out of the budget.
+    if (sunEnergy>0.0) {
+        for (int slot=MAX_SHADED_LIGHTS-1; slot>0; --slot) {
+            selectedEnergy[slot]=selectedEnergy[slot-1];
+            selectedDirections[slot]=selectedDirections[slot-1];
+            selectedRadiance[slot]=selectedRadiance[slot-1];
+            selectedDistances[slot]=selectedDistances[slot-1];
+            selectedDiffuse[slot]=selectedDiffuse[slot-1];
+            selectedRequireSkyPortal[slot]=selectedRequireSkyPortal[slot-1];
+            selectedSunExtent[slot]=selectedSunExtent[slot-1];
+        }
+        selectedEnergy[0]=sunEnergy;
+        selectedDirections[0]=sunDirection;
+        selectedRadiance[0]=sunRadiance;
+        selectedDistances[0]=sunDistance;
+        selectedDiffuse[0]=sunDiffuse;
+        selectedRequireSkyPortal[0]=sunRequireSkyPortal;
+        selectedSunExtent[0]=sunExtentSelected;
+    }
+    vec3 directDiffuse=vec3(0.0);
+    vec3 strongestLightDirection=normalize(-cameraData.sunDirectionIntensity.xyz);
+    vec3 strongestRadiance=vec3(0.0);
+    float strongestEnergy=0.0;
+    bool interactive = (cameraData.renderControls.z & CONTROL_INTERACTIVE) != 0u;
+    int shadedLightCount = interactive ? INTERACTIVE_SHADED_LIGHTS : MAX_SHADED_LIGHTS;
+    // Shadow-ray budget for a settled pixel.
+    //
+    // Raising the light count to 8 would otherwise cost 8 x 4 = 32 rays once
+    // every light is multi-sampled for its penumbra. Spend the budget strongest
+    // first instead: the leading lights get the full 4-sample treatment and the
+    // rest get one ray each, which keeps soft shadows where they are actually
+    // legible while holding the total at or under the budget. Shading more
+    // lights with harder shadows beats shading fewer, because a light that is
+    // dropped entirely leaves a hard *edge* where it stops being shaded, which
+    // is far more visible than a hard shadow edge from a dim light.
+    const int SETTLED_SHADOW_RAY_BUDGET = 16;
+    const int MULTI_SAMPLE_RAYS = 4;
+    // Largest k with k*RAYS + (n - k) <= BUDGET.
+    int multiSampledSlots = clamp((SETTLED_SHADOW_RAY_BUDGET - shadedLightCount) /
+                                      (MULTI_SAMPLE_RAYS - 1),
+                                  0, shadedLightCount);
+    for (int slot=0; slot<shadedLightCount; ++slot) {
+        if (selectedEnergy[slot]<=0.0) continue;
+        float transmission;
+        // VRAD's extra sampling pass (-extra, on by default in a real compile)
+        // splits every luxel into a grid of sample points and averages them,
+        // which is what makes a shadow edge fade instead of ending abruptly.
+        // The preview shades per pixel, so it simulates the same thing by
+        // averaging the shadow ray over the luxel's own footprint: the shading
+        // point stays put, only the ray origin moves. Keeping N.L and the
+        // distance falloff at the pixel avoids dragging them off the surface at
+        // a face edge, exactly as rad_luxel_direct does.
+        //
+        // The offsets are a fixed 2x2 in luxel space, so neighbouring pixels
+        // inside one luxel agree and the result is a gradient rather than
+        // noise. Settled frames only; an interactive frame keeps one ray.
+        //
+        // Only the slots the budget reaches spend more than one ray. The sun is
+        // slot 0, so it keeps its sampling whenever the budget allows any.
+        bool multiSample = !interactive && slot < multiSampledSlots;
+        vec3 luxelU, luxelV;
+        bool superSample = multiSample && luxelFootprint(hit.primitive, luxelU, luxelV);
+        // SunSpreadAngle. VRAD spends 30 rays on the sun's disc per sample,
+        // which is what makes a sun shadow sharp where it meets its caster and
+        // soft at the far end. One ray can only ever give a hard edge, so a
+        // settled preview spends four - enough for the gradient to read - and
+        // an interactive frame still spends one.
+        float sunExtent = selectedSunExtent[slot];
+        if (multiSample && sunExtent > 0.0) {
+            vec3 toLight = selectedDirections[slot];
+            vec3 tangent = normalize(abs(toLight.z) < 0.999
+                                         ? cross(toLight, vec3(0.0, 0.0, 1.0))
+                                         : cross(toLight, vec3(0.0, 1.0, 0.0)));
+            vec3 bitangent = cross(toLight, tangent);
+            // Matching GatherSampleSkyLightSSE: the offset is a point on the
+            // unit SPHERE scaled by the extent, not on a disc, so the penumbra
+            // comes out as wide as VRAD's rather than narrower.
+            const int SUN_DISC_SAMPLES = 4;
+            float rotation = randomFloat(randomState) * 6.28318530718;
+            float accumulated = 0.0;
+            for (int s = 0; s < SUN_DISC_SAMPLES; ++s) {
+                float angle = rotation + 6.28318530718 * (float(s) + 0.5) / float(SUN_DISC_SAMPLES);
+                float height = 1.0 - 2.0 * ((float(s) + 0.5) / float(SUN_DISC_SAMPLES));
+                float ring = sqrt(max(0.0, 1.0 - height * height));
+                vec3 offset = (tangent * (cos(angle) * ring) + bitangent * (sin(angle) * ring) +
+                               toLight * height) * sunExtent;
+                vec3 jittered = normalize(toLight + offset);
+                // Each disc sample also moves within the luxel, so the sun gets
+                // both its penumbra and the luxel footprint for four rays
+                // rather than sixteen.
+                HitRecord shadowHit = hit;
+                if (superSample) {
+                    vec2 cell = vec2(float(s & 1), float((s >> 1) & 1)) * 0.5 - 0.25;
+                    shadowHit.position += luxelU * cell.x + luxelV * cell.y;
+                }
+                accumulated += lightTransmission(surfaceRayOrigin(shadowHit, jittered), jittered,
+                                                 selectedDistances[slot],
+                                                 selectedRequireSkyPortal[slot]);
+            }
+            transmission = accumulated / float(SUN_DISC_SAMPLES);
+        } else if (superSample) {
+            const int LUXEL_SUPERSAMPLES = 2;
+            float accumulated = 0.0;
+            for (int sy = 0; sy < LUXEL_SUPERSAMPLES; ++sy) {
+                for (int sx = 0; sx < LUXEL_SUPERSAMPLES; ++sx) {
+                    vec2 cell = (vec2(sx, sy) + 0.5) / float(LUXEL_SUPERSAMPLES) - 0.5;
+                    HitRecord shadowHit = hit;
+                    shadowHit.position += luxelU * cell.x + luxelV * cell.y;
+                    accumulated += lightTransmission(
+                        surfaceRayOrigin(shadowHit, selectedDirections[slot]),
+                        selectedDirections[slot], selectedDistances[slot],
+                        selectedRequireSkyPortal[slot]);
+                }
+            }
+            transmission = accumulated / float(LUXEL_SUPERSAMPLES * LUXEL_SUPERSAMPLES);
+        } else {
+            transmission = lightTransmission(surfaceRayOrigin(hit, selectedDirections[slot]),
+                                             selectedDirections[slot], selectedDistances[slot],
+                                             selectedRequireSkyPortal[slot]);
+        }
+        if (transmission <= 0.005) continue;
+        directDiffuse += warpedDiffuse(material, selectedDiffuse[slot]) *
+                         selectedRadiance[slot] * transmission;
+        if (selectedEnergy[slot]>strongestEnergy &&
+            max(max(selectedRadiance[slot].r, selectedRadiance[slot].g),
+                selectedRadiance[slot].b) > 0.0) {
+            strongestEnergy=selectedEnergy[slot];
+            strongestLightDirection=selectedDirections[slot];
+            strongestRadiance=selectedRadiance[slot];
+        }
+    }
+
+    // Ambient occlusion only. A one-bounce gather lived here briefly and was
+    // removed: at a live ray budget (3-4 rays per settled pixel) every pixel on
+    // a surface ends up tracing nearly the same few directions, so nearby
+    // geometry is projected onto the surface as hard-edged patches of its
+    // colour rather than integrated into smooth fill. Deriving the directions
+    // from the surface normal instead only trades that for a frame that rotates
+    // with the normal, which faceted props per polygon. Neither is a sampling
+    // pattern problem - a hemisphere gather needs either far more rays or a
+    // spatial denoise pass to hold together, and the accurate answer for bounce
+    // is the VRAD radiosity solve in RadiosityBake/rad_*.comp, which is written
+    // but not yet wired into the build.
+    float ao = 1.0;
+    if (!interactive) {
+        vec3 aoDirection = cosineHemisphere(normal, randomState);
+        float visibleSample = lightTransmission(surfaceRayOrigin(hit, aoDirection),
+                                                 aoDirection, 768.0, false);
+        ao = mix(0.35, 1.0, visibleSample) * cameraData.effectIntensities.w;
+    }
+    // Sky texels are now linear, so the original Hammer preview coefficients
+    // provide useful fill without the old gamma-space fullbright washout.
+    vec3 skyProbeDirection=normalize(normal*0.35+vec3(0.0,0.0,1.0));
+    float environmentTransmission = lightTransmission(surfaceRayOrigin(hit, skyProbeDirection),
+                                                     skyProbeDirection, 131072.0, true);
+    vec3 environmentAmbient = mapEnvironmentAmbient() * ao * environmentTransmission;
+    // Bounced light from the radiosity solve. Where it is available it is the
+    // real thing and the constant sky fill is dropped to a token amount: the
+    // old coefficients existed only to stand in for bounce, so keeping them at
+    // full strength on top would wash the solve out.
+    // No ambient occlusion on the bounce term. The radiosity solve already
+    // traced visibility when it built its transfer lists, so the light arriving
+    // here has been through the geometry once. Attenuating it again by AO
+    // double-counted the same occlusion and cost up to 65% of the indirect
+    // light exactly where bounce matters most - corners and interiors - which
+    // is a large part of why the preview read darker than a compiled map. AO
+    // stays on the sky fill below, where it stands in for hemisphere visibility
+    // that nothing else measures.
+    vec3 indirect = radiosityAt(hit.primitive, hit.position);
+    bool baked = cameraData.radiosityControls.z != 0u &&
+                 (triangles[hit.primitive].data.y & TRIANGLE_HAS_LIGHTMAP) != 0u;
+    // A static prop carries its bounce in an ambient cube instead of a lightmap.
+    // Until this was wired up props fell through to the constant sky fill below,
+    // which is why they read flat and dark next to the world geometry they stand
+    // on - the floor had a bounce solution and the crate on it did not.
+    vec3 propIndirect;
+    if (!baked && propRadiosity(hit, normal, propIndirect)) {
+        indirect = propIndirect;
+        baked = true;
+    }
+    float skyFill = baked ? 0.04 : 0.19 + 0.23 * ao;
+    vec3 ambient = sampleSky(normal) * skyFill + environmentAmbient;
+    vec3 color = base.rgb * (ambient + directDiffuse + indirect);
+    vec3 materialHighlight = vec3(0.0);
+
+    float exponentSample = 1.0;
+    float rimMask = 1.0;
+    float phongExponent = material.phongTintExponent.w;
+    if ((material.flags.x & RT_HAS_EXPONENT) != 0u) {
+        vec4 exponentTexture = sampleRect(material.exponentRect, hit.uv, vec4(1.0));
+        exponentSample = exponentTexture.r;
+        rimMask = (material.flags.x & RT_RIM_MASK_EXPONENT_ALPHA) != 0u
+            ? exponentTexture.a : 1.0;
+        if ((material.flags.x & RT_PHONG_EXPONENT_OVERRIDE) == 0u)
+            phongExponent = max(1.0, exponentSample * 255.0);
+    }
+
+    float baseAlphaMask = base.a;
+    float directPhongMask = (material.flags.x & RT_PHONG_MASK_BASE_ALPHA) != 0u
+        ? baseAlphaMask : normalAlpha;
+    float envMask = 1.0;
+    if ((material.flags.x & RT_ENV_MASK_BASE_ALPHA) != 0u) envMask = baseAlphaMask;
+    else if ((material.flags.x & RT_ENV_MASK_NORMAL_ALPHA) != 0u) envMask = normalAlpha;
+    if ((material.flags.x & RT_INVERT_SPECULAR_MASK) != 0u) envMask = 1.0 - envMask;
+
+    if ((cameraData.renderControls.z & CONTROL_PHONG) != 0u &&
+        (material.flags.x & RT_PHONG) != 0u && strongestEnergy > 0.0) {
+        vec3 halfDirection = normalize(strongestLightDirection + viewDirection);
+        float specular = pow(max(dot(normal, halfDirection), 0.0), max(phongExponent, 1.0));
+        float viewDot = clamp(dot(normal, viewDirection), 0.0, 1.0);
+        vec3 ranges = material.phongFresnelRimExponent.xyz;
+        float fresnel = mix(ranges.x, ranges.y, pow(1.0 - viewDot, max(ranges.z, 0.01)));
+        vec3 tint = material.phongTintExponent.rgb;
+        if ((material.flags.x & RT_PHONG_ALBEDO_TINT) != 0u) tint *= base.rgb;
+        materialHighlight += tint * specular * directPhongMask * fresnel * material.envTintBoost.w *
+                             cameraData.effectIntensities.x * strongestRadiance;
+    }
+
+    if ((cameraData.renderControls.z & CONTROL_SPECULAR) != 0u &&
+        (material.flags.x & (RT_SPECULAR | RT_HAS_ENVMAP)) != 0u && envMask > 0.001) {
+        vec3 reflectedDirection = reflect(rayDirection, normal);
+        HitRecord reflectedHit;
+        reflectedHit.hit = false;
+        vec3 reflected = sampleSky(reflectedDirection);
+        if (!interactive) {
+            reflectedHit = traceScene(surfaceRayOrigin(hit, reflectedDirection),
+                                      reflectedDirection, 0.02, 32768.0);
+            reflected = simpleSecondaryColor(reflectedHit, reflectedDirection);
+        }
+        if (!reflectedHit.hit && (material.flags.x & RT_HAS_ENVMAP) != 0u)
+            reflected = sampleCubeRects(material.environmentRects, reflectedDirection, reflected);
+        float fresnel = 0.04 + 0.96 * pow(1.0 - clamp(dot(normal, viewDirection), 0.0, 1.0), 5.0);
+        materialHighlight += reflected * material.envTintBoost.rgb * material.selfIllumTintSpecular.w *
+                             envMask * fresnel * cameraData.effectIntensities.y;
+    }
+
+    if ((cameraData.renderControls.z & CONTROL_SELFILLUM) != 0u &&
+        (material.flags.x & RT_SELFILLUM) != 0u) {
+        float mask = (material.flags.x & RT_HAS_SELFILLUM_MASK) != 0u
+            ? sampleRect(material.selfIllumRect, hit.uv, vec4(0.0)).r : base.a;
+        if ((material.flags.x & RT_SELFILLUM_FRESNEL) != 0u) {
+            vec3 f = material.selfIllumFresnelRimBoost.xyz;
+            float fresnel = pow(1.0 - clamp(dot(normalize(hit.normal), viewDirection), 0.0, 1.0),
+                                max(f.z, 0.01));
+            mask *= mix(f.x, f.y, fresnel);
+        }
+        color = mix(color, base.rgb * material.selfIllumTintSpecular.rgb, clamp(mask, 0.0, 1.0));
+    }
+
+    if ((cameraData.renderControls.z & CONTROL_RIMLIGHT) != 0u &&
+        (material.flags.x & RT_RIMLIGHT) != 0u && (material.flags.x & RT_PHONG) != 0u) {
+        float rim = pow(1.0 - clamp(dot(normal, viewDirection), 0.0, 1.0),
+                        max(material.phongFresnelRimExponent.w, 1.0));
+        materialHighlight += sampleSky(-viewDirection) * rim * rimMask *
+                             material.selfIllumFresnelRimBoost.w * 0.35;
+    }
+
+    // Match the normal renderer's highlight handling. Phong/envmap/rim energy
+    // should not simply overflow the HDR albedo and then get per-channel clipped
+    // by the display target; compress ordinary material highlights and add them
+    // into remaining headroom. Explicit Über/high-energy materials retain their
+    // authored overbright behavior.
+    if ((material.flags.x & (RT_HIGH_ENERGY | RT_UBER)) != 0u) {
+        color += min(materialHighlight, vec3(4.0));
+    } else {
+        materialHighlight = materialHighlight / (vec3(1.0) + materialHighlight);
+        color += materialHighlight * max(vec3(1.0) - color, vec3(0.12));
+    }
+
+    if ((material.flags.x & (RT_HIGH_ENERGY | RT_UBER)) != 0u) {
+        float edge = pow(1.0 - clamp(dot(normal, viewDirection), 0.0, 1.0), 2.0);
+        color += material.color2.rgb * edge * ((material.flags.x & RT_UBER) != 0u ? 0.9 : 0.35);
+    }
+    if ((material.flags.x & RT_DECAL_MODULATE) != 0u)
+        color = mix(vec3(1.0), color * 2.0, base.a);
+    return max(color, vec3(0.0));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputImage);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    vec2 jitter = vec2(0.5);
+    uint randomState = hashValue(uvec3(uvec2(pixel), cameraData.renderControls.w + 1u));
+    if ((cameraData.renderControls.z & CONTROL_DENOISE) != 0u)
+        jitter = vec2(randomFloat(randomState), randomFloat(randomState));
+    vec2 normalizedPixel = (vec2(pixel) + jitter) / vec2(size);
+    vec2 screen = normalizedPixel * 2.0 - 1.0;
+    screen.y = -screen.y;
+    vec3 direction = normalize(cameraData.cameraForwardTanHalfFov.xyz +
+                               cameraData.cameraRightAspect.xyz *
+                                   (screen.x * cameraData.cameraRightAspect.w *
+                                    cameraData.cameraForwardTanHalfFov.w) +
+                               cameraData.cameraUpNear.xyz *
+                                   (screen.y * cameraData.cameraForwardTanHalfFov.w));
+    vec3 color = vec3(0.0);
+    float transmission = 1.0;
+    vec3 rayOrigin = cameraData.cameraPosition.xyz;
+    float rayMinimum = max(cameraData.cameraUpNear.w, 0.01);
+    for (int layer = 0; layer < 4 && transmission > 0.01; ++layer) {
+        HitRecord hit = traceScene(rayOrigin, direction, rayMinimum, 262144.0);
+        if (!hit.hit) {
+            color += sampleSky(direction) * transmission;
+            transmission = 0.0;
+            break;
+        }
+        float opacity = surfaceOpacity(hit);
+        color += shadeSurface(hit, direction, randomState) * (transmission * opacity);
+        transmission *= (1.0 - opacity);
+        if (transmission <= 0.01) break;
+        // The origin stays at the camera and only the minimum t moves, so the
+        // step past this hit is a couple of thousandths of a unit rather than
+        // 0.08. The old fixed step overshot the 0.04 offset that decals and
+        // overlays are built with, so seeing through a decal's transparent
+        // texels skipped the wall it was stuck to and showed what was behind it.
+        rayMinimum = advancedRayMinimum(hit.distance);
+    }
+    if (transmission > 0.01) color += sampleSky(direction) * transmission;
+
+    // Match Source's modern eye-adaptation histogram without adding another
+    // full-screen pass.  Source measures the central 90% x 85% region and uses
+    // 16 non-linear luminance buckets whose boundaries are (i/16)^1.5.  Sampling
+    // one pixel per 16x16 block is enough for a stable editor preview and keeps
+    // the RT cost negligible.
+    if ((pixel.x & 15) == 0 && (pixel.y & 15) == 0) {
+        vec2 histogramUv = (vec2(pixel) + vec2(0.5)) / vec2(size);
+        vec2 centered = abs(histogramUv - vec2(0.5));
+        if (centered.x <= 0.45 && centered.y <= 0.425) {
+            vec3 exposedForHistogram = max(color, vec3(0.0)) * max(cameraData.toneMapControls.x, 0.0);
+            float luminance = dot(exposedForHistogram, vec3(0.2126, 0.7152, 0.0722));
+            float normalizedLuminance = clamp(luminance, 0.0, 1.0);
+            uint bucket = min(15u, uint(floor(pow(normalizedLuminance, 2.0 / 3.0) * 16.0)));
+            if (normalizedLuminance >= 1.0) bucket = 15u;
+            atomicAdd(exposureHistogram[bucket], 1u);
+            atomicAdd(exposureHistogram[16], 1u);
+        }
+    }
+
+    // Stop at linear light. Exposure, bloom, the gamma conversion and the
+    // colour-correction lookup all happen in composite.comp, in that order,
+    // because bloom has to sample the frame before tonemapping compressed it.
+    imageStore(hdrTarget, pixel, vec4(finiteColor(color), 1.0));
+}

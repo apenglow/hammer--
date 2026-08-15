@@ -1,0 +1,56 @@
+# Build environment for a portable Hammer-- AppImage.
+#
+# An AppImage does not bundle glibc, so its compatibility floor is the glibc
+# of the machine that built it. Building on the host (Fedora, glibc 2.42)
+# produced AppImages that failed on Ubuntu/Debian with
+# "version `GLIBC_ABI_GNU2_TLS' not found". This image pins the floor to
+# ubuntu:22.04 (glibc 2.35) and uses the official Qt 6.5.3 binaries, which
+# are themselves built against an even older glibc.
+#
+# Build once:  podman build -t hammer-appimage-build -f scripts/Containerfile.appimage scripts
+# Then package with: scripts/package-appimage-container.sh
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential g++-12 gcc-12 cmake ninja-build git curl ca-certificates \
+        python3 python3-pip file imagemagick \
+        # Vulkan ray-traced preview (must not silently drop out of the build)
+        glslang-tools libvulkan-dev \
+        # Qt platform/runtime deps: linuxdeploy resolves bundled libraries
+        # through ldd, so everything Qt links must be present here
+        libgl-dev libegl-dev libopengl-dev libglu1-mesa-dev \
+        libfontconfig1-dev libfreetype-dev libx11-dev libx11-xcb-dev \
+        libxext-dev libxfixes-dev libxi-dev libxrender-dev libxcb1-dev \
+        libxcb-cursor0 libxcb-glx0 libxcb-keysyms1 libxcb-image0 \
+        libxcb-shm0 libxcb-icccm4 libxcb-sync1 libxcb-xfixes0 \
+        libxcb-shape0 libxcb-randr0 libxcb-render-util0 libxcb-render0 \
+        libxcb-xinerama0 libxcb-xkb1 libxcb-util1 libxkbcommon-dev \
+        libxkbcommon-x11-0 libwayland-dev libdbus-1-3 \
+        # AppImage tooling runs with --appimage-extract-and-run; zsync for appimagetool
+        zsync desktop-file-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100
+
+# Official Qt 6.5.3 desktop binaries (built against a ~2.28 glibc).
+RUN pip3 install --no-cache-dir aqtinstall \
+    && aqt install-qt linux desktop 6.5.3 gcc_64 -O /opt/qt \
+    && rm -rf /root/.cache
+
+# Ubuntu 22.04's cmake is 3.22; the project requires 3.24+. The pip wheel
+# lands in /usr/local/bin, ahead of apt's copy on PATH.
+RUN pip3 install --no-cache-dir 'cmake>=3.24'
+
+# GameNetworkingSockets (vendored via FetchContent) needs OpenSSL headers.
+# A separate layer so the big apt/Qt layers above stay cached.
+RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/opt/qt/6.5.3/gcc_64/bin:$PATH \
+    CMAKE_PREFIX_PATH=/opt/qt/6.5.3/gcc_64 \
+    QMAKE=/opt/qt/6.5.3/gcc_64/bin/qmake \
+    # linuxdeploy resolves dependencies through the linker path, and aqt's Qt
+    # lives outside ldconfig's world.
+    LD_LIBRARY_PATH=/opt/qt/6.5.3/gcc_64/lib

@@ -1,0 +1,72 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+
+// VRAD pass: build each patch's transfer list.
+//
+// VRAD computes form factors between patches that see each other through the
+// PVS (MakeTransfers). With no BSP there is no PVS, so visibility comes from the
+// acceleration structure: each patch fires a cosine-distributed ray set and
+// records which patch each ray landed on. Because the rays are cosine weighted,
+// every surviving transfer carries the same weight, and the whole set sums to
+// the patch's form-factor mass. Sampling once here is what makes 100 bounces
+// affordable later: the bounce pass only re-reads this list.
+
+layout(local_size_x = 64) in;
+
+#include "rad_common.glsl"
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= radControl.counts.y) return;
+
+    uint perPatch = radControl.counts.z;
+    uint base = index * perPatch;
+    LuxelRecord patchSample = patches[index];
+    vec3 position = patchSample.position.xyz;
+    vec3 normal = normalize(patchSample.normal.xyz);
+    vec3 origin = position + normal * radControl.tuning.y;
+
+    // Every ray that lands on a patch contributes 1/perPatch of the hemisphere.
+    float weight = 1.0 / float(perPatch);
+
+    for (uint i = 0u; i < perPatch; ++i) {
+        transfers[base + i].target = 0xffffffffu;
+        transfers[base + i].weight = 0.0;
+
+        vec3 direction = radStratifiedHemisphere(normal, i, perPatch);
+
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query, sceneAccelerationStructure, gl_RayFlagsNoneEXT, 0xffu,
+                              origin, 0.05, direction, 131072.0);
+        while (rayQueryProceedEXT(query)) {
+            if (rayQueryGetIntersectionTypeEXT(query, false) !=
+                gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+            uint primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, false);
+            uint flags = triangles[primitive].data.y;
+            if ((flags & TRIANGLE_NO_SHADOW) != 0u) continue;
+            vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, false);
+            MaterialRecord material = materials[triangles[primitive].data.x];
+            if (!candidateHasCoverage(material, baseSampleForCandidate(primitive, bary), flags))
+                continue;
+            rayQueryConfirmIntersectionEXT(query);
+        }
+        if (rayQueryGetIntersectionTypeEXT(query, true) !=
+            gl_RayQueryCommittedIntersectionTriangleEXT) continue;
+
+        uint primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+        // Sky is an emitter, not a reflector; it contributes through the
+        // skyambient term rather than through a transfer.
+        if ((triangles[primitive].data.y & TRIANGLE_SKY) != 0u) continue;
+
+        float distance = rayQueryGetIntersectionTEXT(query, true);
+        vec3 hit = origin + direction * distance;
+        uint target = patchAtHit(primitive, hit);
+        if (target == 0xffffffffu) continue;
+
+        // TRANSFER_EPSILON. VRAD discards transfers below this.
+        if (weight < 0.0000001) continue;
+        transfers[base + i].target = target;
+        transfers[base + i].weight = weight;
+    }
+}

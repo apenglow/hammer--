@@ -1,0 +1,79 @@
+#version 460
+
+// Source HDR bloom, stage 1: bright pass + quarter-resolution downsample.
+//
+// Generate8BitBloomTexture() downsamples the HDR framebuffer to a quarter of
+// each axis, keeping only the bright end of the image.
+//
+// The threshold is deliberately tied to the auto-exposure target rather than to
+// displayable white. updateToneMapFromHistogram() drives the top 2% of scene
+// luminance toward 0.60, so a converged frame has almost nothing above 1.0 and
+// a "brighter than white" test would produce no bloom at all. Thresholding at
+// the same 0.60 the exposure loop aims for means the brightest few percent of
+// the frame blooms, and it keeps doing so as exposure adapts.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std140, set = 0, binding = 7) uniform CameraBuffer {
+    vec4 cameraPosition;
+    vec4 cameraForwardTanHalfFov;
+    vec4 cameraRightAspect;
+    vec4 cameraUpNear;
+    vec4 sunDirectionIntensity;
+    vec4 sunColorTime;
+    vec4 effectIntensities;
+    vec4 backgroundColor;
+    uvec4 renderControls;
+    vec4 skyRects[6];
+    // x = tone scale, y = bloom scale, z = uncorrected colour-correction weight.
+    vec4 toneMapControls;
+    vec4 colorCorrectionWeights;
+    uvec4 colorCorrectionIndices;
+    uvec4 radiosityControls;
+} cameraData;
+
+layout(set = 0, binding = 14, rgba16f) uniform readonly image2D hdrImage;
+layout(set = 0, binding = 15, rgba16f) uniform writeonly image2D bloomTarget;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 target = imageSize(bloomTarget);
+    if (pixel.x >= target.x || pixel.y >= target.y) return;
+
+    ivec2 source = imageSize(hdrImage);
+    float exposure = max(cameraData.toneMapControls.x, 0.0);
+
+    // A texel at or above the threshold contributes its whole colour, not just
+    // the part above it: passing only the excess leaves nothing to blur once
+    // auto-exposure has settled the frame's bright end near the threshold.
+    //
+    // Because the whole colour is passed, the threshold has to sit *above* the
+    // exposure loop's 0.60 bright-end target, not below it. At 0.50 a sunlit
+    // frame has most of its area above the line, so the blur is a copy of the
+    // scene and adding it back reads as a milky veil over everything rather
+    // than as glow around highlights. 0.90 with a tight knee keeps it to texels
+    // that are genuinely near clipping.
+    const float kThreshold = 0.90;
+    const float kKnee = 0.10;
+
+    // 4x4 box over the source region this texel covers. Source's downsample is
+    // two chained 2x2 steps; one 4x4 gather is the same footprint in one pass.
+    vec3 accumulated = vec3(0.0);
+    float taps = 0.0;
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            ivec2 coordinate = pixel * 4 + ivec2(x, y);
+            if (coordinate.x >= source.x || coordinate.y >= source.y) continue;
+            vec3 exposed = max(imageLoad(hdrImage, coordinate).rgb, vec3(0.0)) * exposure;
+            // Luminance decides whether a texel blooms, but the texel keeps its
+            // own colour, so a saturated light blooms in its own hue rather than
+            // bleaching toward white.
+            float luminance = dot(exposed, vec3(0.2126, 0.7152, 0.0722));
+            float factor = smoothstep(kThreshold - kKnee, kThreshold + kKnee, luminance);
+            accumulated += exposed * factor;
+            taps += 1.0;
+        }
+    }
+    if (taps > 0.0) accumulated /= taps;
+    imageStore(bloomTarget, pixel, vec4(accumulated, 1.0));
+}

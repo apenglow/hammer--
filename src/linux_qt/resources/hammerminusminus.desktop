@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hammer--
+Comment=Source map editor
+Exec=hammerminusminus %F
+Icon=hammerminusminus
+Terminal=false
+Categories=Development;Graphics;
+MimeType=application/x-valve-vmf;
+StartupWMClass=hammerminusminus

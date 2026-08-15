@@ -1,0 +1,104 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+
+// VRAD pass: -StaticPropLighting, bounce only.
+//
+// ComputeStaticPropLighting() lights props per vertex rather than through a
+// lightmap, because a static prop has no lightmap parameterisation. Source
+// stores the result as an ambient cube - six directional coefficients - not as
+// a single irradiance value, and that is what lets a normal-mapped prop still
+// show surface detail after the bake. Storing one scalar per vertex discards
+// the direction and leaves low-poly props reading as flat triangles.
+//
+// Only *indirect* light is baked here. The preview computes direct light per
+// pixel with its own shadow rays, which is strictly better than anything a
+// per-vertex bake can carry, and sky ambient is evaluated per pixel too. Baking
+// either one here as well would double them. This mirrors how world faces work:
+// patchTotal holds bounced light alone and direct is added at shade time.
+//
+// One invocation per triangle, three cubes per triangle - one per corner. A
+// triangle knows its own slot (data.w), so batching over a vertex range cannot
+// alias, and a shading pixel can reach its cubes from the primitive index it
+// already has.
+
+layout(local_size_x = 64) in;
+
+#include "rad_common.glsl"
+
+// Indirect rays per corner. The hemisphere is stratified, so this is a quality
+// knob rather than a noise/no-noise switch.
+const uint DEFAULT_INDIRECT_RAYS = 32u;
+
+// The cube stores, per axis, the mean of radiance * max(dot(direction, axis), 0)
+// over a cosine-weighted hemisphere. Reconstructing that with radEvaluateCube
+// under uniform incoming radiance L returns L * E[cos] = 2L/3, because a
+// cosine-weighted direction has E[dot(d, n)] = 2/3. World faces read patchTotal
+// straight through, so without this the same bounced light would render a prop
+// a third darker than the floor it stands on.
+const float CUBE_NORMALIZATION = 1.5;
+
+// The radiosity leaving a patch: B = P * (E + SUM(B * F)). patchTotal holds only
+// the gathered part, so a gather that read it alone would miss the direct light
+// every bounce actually starts from, and would skip the surface's own colour -
+// which is where colour bleed comes from.
+// (`patch` is a reserved word in GLSL, hence the name.)
+vec3 patchExitance(uint index) {
+    return patchReflectivity[index].rgb *
+           (patchDirect[index].rgb + patchTotal[index].rgb);
+}
+
+void gatherCorner(uint vertexIndex, uint slot, uint rays) {
+    VertexRecord vertex = vertices[vertexIndex];
+    vec3 position = vertex.position.xyz;
+    vec3 normal = normalize(vertex.normal.xyz);
+
+    vec3 cube[6];
+    for (int axis = 0; axis < 6; ++axis) cube[axis] = vec3(0.0);
+
+    vec3 origin = position + normal * radControl.tuning.y;
+    for (uint i = 0u; i < rays; ++i) {
+        vec3 direction = radStratifiedHemisphere(normal, i, rays);
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query, sceneAccelerationStructure, gl_RayFlagsNoneEXT, 0xffu,
+                              origin, 0.05, direction, 131072.0);
+        while (rayQueryProceedEXT(query)) {
+            if (rayQueryGetIntersectionTypeEXT(query, false) !=
+                gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+            uint primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, false);
+            uint flags = triangles[primitive].data.y;
+            if ((flags & TRIANGLE_NO_SHADOW) != 0u) continue;
+            vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, false);
+            if (!candidateHasCoverage(materials[triangles[primitive].data.x],
+                                      baseSampleForCandidate(primitive, bary), flags)) continue;
+            rayQueryConfirmIntersectionEXT(query);
+        }
+        if (rayQueryGetIntersectionTypeEXT(query, true) !=
+            gl_RayQueryCommittedIntersectionTriangleEXT) continue;
+        uint primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+        // Sky is an emitter handled per pixel, not a reflector.
+        if ((triangles[primitive].data.y & TRIANGLE_SKY) != 0u) continue;
+        vec3 hit = origin + direction * rayQueryGetIntersectionTEXT(query, true);
+        uint target = patchAtHit(primitive, hit);
+        if (target == 0xffffffffu) continue;
+        radAccumulateCube(cube, direction, patchExitance(target) / float(rays));
+    }
+
+    // Alpha marks the slot as solved; the preview falls back to its ambient
+    // approximation for any prop this pass did not reach.
+    uint base = slot * 6u;
+    for (int axis = 0; axis < 6; ++axis)
+        propCube[base + uint(axis)] =
+            vec4(max(cube[axis] * CUBE_NORMALIZATION, vec3(0.0)), 1.0);
+}
+
+void main() {
+    uint primitive = push.value.x + gl_GlobalInvocationID.x;
+    if (gl_GlobalInvocationID.x >= push.value.y) return;
+    uint slot = triangles[primitive].data.w;
+    if (slot == 0xffffffffu) return;
+
+    uint rays = push.value.z > 0u ? push.value.z : DEFAULT_INDIRECT_RAYS;
+    for (uint corner = 0u; corner < 3u; ++corner)
+        gatherCorner(indices[primitive * 3u + corner], slot * 3u + corner, rays);
+}

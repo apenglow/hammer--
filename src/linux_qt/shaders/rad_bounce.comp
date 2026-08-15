@@ -1,0 +1,46 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+
+// VRAD pass: one radiosity bounce.
+//
+// The radiosity equation VRAD solves is Bi = Ei + Pi * SUMj(Bj * Fij). This pass
+// evaluates one iteration of that sum over the transfer list built once by
+// rad_transfers, so the -bounce 100 the user asked for is 100 dispatches of pure
+// buffer math with no further ray tracing.
+//
+// push.value.x carries the bounce index; even bounces read A and write B,
+// odd bounces read B and write A. It has to be a push constant rather than a
+// uniform because all 100 iterations are recorded into one submission.
+
+layout(local_size_x = 64) in;
+
+#include "rad_common.glsl"
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= radControl.counts.y) return;
+
+    uint perPatch = radControl.counts.z;
+    uint base = index * perPatch;
+    bool readA = (push.value.x & 1u) == 0u;
+
+    // Gather the energy arriving from every patch this one can see.
+    vec3 incoming = vec3(0.0);
+    for (uint i = 0u; i < perPatch; ++i) {
+        uint source = transfers[base + i].target;
+        if (source == 0xffffffffu) continue;
+        vec3 previous = readA ? patchBounceA[source].rgb : patchBounceB[source].rgb;
+        incoming += previous * transfers[base + i].weight;
+    }
+
+    // Pi * SUMj(...): only the reflected fraction leaves this patch again.
+    vec3 emitted = patchReflectivity[index].rgb * incoming;
+
+    if (readA) patchBounceB[index] = vec4(emitted, 0.0);
+    else       patchBounceA[index] = vec4(emitted, 0.0);
+
+    // totallight accumulates the bounced energy; direct light is added at
+    // resolve time so the luxel grid keeps its full-resolution shadows.
+    patchTotal[index] = vec4(patchTotal[index].rgb + incoming, 0.0);
+}

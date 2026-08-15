@@ -1,0 +1,81 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+
+// VRAD pass: combine direct luxels with bounced patch light, then dilate.
+//
+// Mode 0 dispatches over luxels and adds the interpolated patch radiosity to the
+// direct light rad_luxel_direct already wrote. Mode 1 dispatches over the whole
+// atlas and fills texels no sample reached, so the gutter around each packed
+// rect does not bleed black into a face's edge under bilinear filtering. This is
+// the equivalent of the border VRAD bakes into every face's lightmap.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "rad_common.glsl"
+
+// Bilinear tap of the patch grid for a world position on a known face.
+vec3 samplePatchGrid(uint rectIndex, vec3 position) {
+    RectRecord record = patchRects[rectIndex];
+    vec2 texel = rectTexel(record, position);
+    vec2 corner = floor(texel - 0.5) + 0.5;
+    vec2 fraction = clamp(texel - corner, 0.0, 1.0);
+
+    vec3 accumulated = vec3(0.0);
+    float total = 0.0;
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            vec2 local = clamp(corner + vec2(x, y), vec2(0.0), record.rect.zw - 1.0);
+            ivec2 atlas = ivec2(record.rect.xy + floor(local));
+            if (atlas.x < 0 || atlas.y < 0 ||
+                atlas.x >= int(radControl.atlasSize.z) ||
+                atlas.y >= int(radControl.atlasSize.w)) continue;
+            uint stored = patchIndexGrid[uint(atlas.y) * radControl.atlasSize.z + uint(atlas.x)];
+            if (stored == 0u) continue;
+            float weight = (x == 0 ? 1.0 - fraction.x : fraction.x) *
+                           (y == 0 ? 1.0 - fraction.y : fraction.y);
+            if (weight <= 0.0) continue;
+            accumulated += patchTotal[stored - 1u].rgb * weight;
+            total += weight;
+        }
+    }
+    return total > 0.0 ? accumulated / total : vec3(0.0);
+}
+
+void main() {
+    if (push.value.x == 0u) {
+        // Luxels are a flat list; the 2D dispatch is linearised here so this
+        // pass can share a workgroup shape with the dilation mode.
+        uint index = gl_GlobalInvocationID.x +
+                     gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * gl_WorkGroupSize.x);
+        if (index >= radControl.counts.x) return;
+
+        LuxelRecord luxel = luxels[index];
+        ivec2 texel = ivec2(luxel.atlas.xy);
+        vec3 direct = imageLoad(lightmapImage, texel).rgb;
+        vec3 indirect = samplePatchGrid(uint(luxel.atlas.w), luxel.position.xyz);
+        imageStore(lightmapImage, texel, vec4(direct + indirect, 1.0));
+        return;
+    }
+
+    ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (texel.x >= int(radControl.atlasSize.x) || texel.y >= int(radControl.atlasSize.y)) return;
+    vec4 current = imageLoad(lightmapImage, texel);
+    if (current.a > 0.0) return;
+
+    vec3 accumulated = vec3(0.0);
+    float count = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 neighbour = texel + ivec2(x, y);
+            if (neighbour.x < 0 || neighbour.y < 0 ||
+                neighbour.x >= int(radControl.atlasSize.x) ||
+                neighbour.y >= int(radControl.atlasSize.y)) continue;
+            vec4 sampled = imageLoad(lightmapImage, neighbour);
+            if (sampled.a <= 0.0) continue;
+            accumulated += sampled.rgb;
+            count += 1.0;
+        }
+    }
+    if (count > 0.0) imageStore(lightmapImage, texel, vec4(accumulated / count, 0.0));
+}
